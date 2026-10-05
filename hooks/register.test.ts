@@ -491,6 +491,15 @@ describe('change alerts', () => {
     expect(await poll()).toEqual(['✓ All checks passed on #899'])
   })
 
+  test('runs cancelled before they start are not a pass', async ($, on) => {
+    stub(on)
+    world.checks = [{ ...CHECKS[1], status: 'QUEUED', conclusion: '' }, { ...CHECKS[2], status: 'QUEUED', conclusion: '' }]
+    const { ui, poll } = await watch($)
+    world.checks = [{ ...CHECKS[1], conclusion: 'CANCELLED' }, { ...CHECKS[2], status: 'COMPLETED', conclusion: 'CANCELLED' }]
+    expect(await poll()).toEqual(['⊘ validate cancelled on #899', '⊘ plan cancelled on #899'])
+    expect(await ui.find({ text: /FAILED · 2/ })).toBeDefined()
+  })
+
   test('a new PR in your review queue', async ($, on) => {
     stub(on)
     const { ui, poll } = await watch($)
@@ -660,6 +669,12 @@ describe('merge readiness', () => {
     const ui = await card($)
     expect(await ui.find({ text: ' ✗ BLOCKED · 1 ' })).toBeDefined()
     expect(await ui.find({ text: '✗ blocked by a branch rule' })).toBeDefined()
+  })
+
+  test('the review state reads naturally', async ($, on) => {
+    stub(on)
+    const ui = await card($)
+    expect(await ui.find({ text: '● review required' })).toBeDefined()
   })
 
   test('a repo with no review rule needs no approval', async ($, on) => {

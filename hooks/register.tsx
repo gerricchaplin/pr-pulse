@@ -84,12 +84,12 @@ const icon = (status: string, conclusion: string): { glyph: string; tone: Outcom
   const c = conclusion.toUpperCase()
   if (c === 'SUCCESS') return { glyph: '✓', tone: 'passed' }
   if (c === 'SKIPPED' || c === 'NEUTRAL') return { glyph: '–', tone: 'skipped' }
-  if (c === 'CANCELLED') return { glyph: '⊘', tone: 'skipped' }
+  if (c === 'CANCELLED') return { glyph: '⊘', tone: 'failed' }
   return { glyph: '✗', tone: 'failed' }
 }
 const isPending = (c: { status: string }) => c.status.toUpperCase() !== 'COMPLETED'
-const isFailed = (c: Check) =>
-  !isPending(c) && !['SUCCESS', 'SKIPPED', 'NEUTRAL', 'CANCELLED'].includes(c.conclusion.toUpperCase())
+// github treats a cancelled required check as failing, so a cancelled run must never read as green
+const isFailed = (c: Check) => !isPending(c) && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion.toUpperCase())
 const OUTCOMES = ['failed', 'running', 'passed', 'skipped'] as const
 type Outcome = (typeof OUTCOMES)[number]
 const outcome = (c: Check): Outcome =>
@@ -98,6 +98,12 @@ const tone = (o: Outcome) => ({ failed: theme.fail, running: theme.run, passed: 
 const GLYPH: Record<Outcome, string> = { failed: '✗', running: '◐', passed: '✓', skipped: '–' }
 const BAR_WIDTH = 30
 const LOG_LINES = 20
+const REVIEW_LABEL: Record<string, string> = {
+  APPROVED: 'approved',
+  CHANGES_REQUESTED: 'changes requested',
+  REVIEW_REQUIRED: 'review required',
+  NONE: 'no review needed',
+}
 const ALERTS_KEPT = 8
 const BAND_ALERT_MS = 60_000 // how long the newest alert stays on the collapsed band
 const BODY_CHARS = 700
@@ -189,7 +195,7 @@ async function refresh($: any, force = false) {
       queueSeen = new Set(reviews.map(r => r.number))
       slowAt = Date.now()
       slowRepo = repo
-      await $.ui.log(`pr-pulse: ${repo} open=${open.length} mine-merged=${history.length} all-merged=${teamMerged.length} reviews=${reviews.length}`)
+      $.ui.log(`${repo} open=${open.length} mine-merged=${history.length} all-merged=${teamMerged.length} reviews=${reviews.length}`, { to: 'debug' })
     }
 
     const chosen: number = await read($, selectedAtom)
@@ -260,7 +266,7 @@ async function refresh($: any, force = false) {
     if (view.job) await loadSteps($, pr, view.job)
     if (view.comments) await loadComments($, pr)
   } catch (err) {
-    await $.ui.log(`pr-pulse: refresh failed: ${String((err as Error).message ?? err)}`)
+    $.ui.log(`refresh failed: ${String((err as Error).message ?? err)}`, { to: 'debug' })
     await update($, errorAtom, () => String((err as Error).message ?? err))
   }
 }
@@ -304,7 +310,8 @@ async function announcePrChanges($: any, prev: Pr | null, pr: Pr) {
   const tag = `#${pr.number}`
   const failedBefore = new Set(prev.checks.filter(isFailed).map(c => c.name))
   for (const c of pr.checks.filter(c => isFailed(c) && !failedBefore.has(c.name))) {
-    await alert($, `✗ ${c.name} failed on ${tag}`, 'fail', c.url)
+    const cancelled = c.conclusion.toUpperCase() === 'CANCELLED'
+    await alert($, `${cancelled ? '⊘' : '✗'} ${c.name} ${cancelled ? 'cancelled' : 'failed'} on ${tag}`, 'fail', c.url)
   }
   const settled = (p: Pr) => p.checks.length > 0 && !p.checks.some(isPending)
   if (!settled(prev) && settled(pr) && !pr.checks.some(isFailed)) await alert($, `✓ All checks passed on ${tag}`, 'ok', pr.url)
@@ -590,7 +597,7 @@ export const register: Register = on => {
   })
 
   on('classic.CwdChanged', async ($, e: any, next) => {
-    await $.ui.log(`pr-pulse: cwd changed to ${e.new_cwd}`)
+    $.ui.log(`cwd changed to ${e.new_cwd}`, { to: 'debug' })
     await followCwd($, String(e.new_cwd ?? ''))
     return next(e)
   })
@@ -812,7 +819,7 @@ export const register: Register = on => {
           <Text color={t.muted}>  ·  </Text>
           <Text color={pr.isDraft ? t.muted : t.ok}>{pr.isDraft ? '○ draft' : `● ${pr.state.toLowerCase()}`}</Text>
           <Text color={t.muted}>  ·  </Text>
-          <Text color={reviewColor}>● review {review.toLowerCase().replace(/_/g, ' ')}</Text>
+          <Text color={reviewColor}>● {REVIEW_LABEL[review] ?? review.toLowerCase().replace(/_/g, ' ')}</Text>
           <Text color={t.muted}>  ·  </Text>
           <Text color={pr.mergeable === 'CONFLICTING' ? t.fail : t.muted}>{pr.mergeable.toLowerCase()}</Text>
         </Text>
