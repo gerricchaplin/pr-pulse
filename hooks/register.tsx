@@ -84,12 +84,12 @@ const icon = (status: string, conclusion: string): { glyph: string; tone: Outcom
   const c = conclusion.toUpperCase()
   if (c === 'SUCCESS') return { glyph: '✓', tone: 'passed' }
   if (c === 'SKIPPED' || c === 'NEUTRAL') return { glyph: '–', tone: 'skipped' }
-  if (c === 'CANCELLED') return { glyph: '⊘', tone: 'skipped' }
+  if (c === 'CANCELLED') return { glyph: '⊘', tone: 'failed' }
   return { glyph: '✗', tone: 'failed' }
 }
 const isPending = (c: { status: string }) => c.status.toUpperCase() !== 'COMPLETED'
-const isFailed = (c: Check) =>
-  !isPending(c) && !['SUCCESS', 'SKIPPED', 'NEUTRAL', 'CANCELLED'].includes(c.conclusion.toUpperCase())
+// github treats a cancelled required check as failing, so a cancelled run must never read as green
+const isFailed = (c: Check) => !isPending(c) && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion.toUpperCase())
 const OUTCOMES = ['failed', 'running', 'passed', 'skipped'] as const
 type Outcome = (typeof OUTCOMES)[number]
 const outcome = (c: Check): Outcome =>
@@ -98,6 +98,12 @@ const tone = (o: Outcome) => ({ failed: theme.fail, running: theme.run, passed: 
 const GLYPH: Record<Outcome, string> = { failed: '✗', running: '◐', passed: '✓', skipped: '–' }
 const BAR_WIDTH = 30
 const LOG_LINES = 20
+const REVIEW_LABEL: Record<string, string> = {
+  APPROVED: 'approved',
+  CHANGES_REQUESTED: 'changes requested',
+  REVIEW_REQUIRED: 'review required',
+  NONE: 'no review needed',
+}
 const ALERTS_KEPT = 8
 const BAND_ALERT_MS = 60_000 // how long the newest alert stays on the collapsed band
 const BODY_CHARS = 700
@@ -189,7 +195,7 @@ async function refresh($: any, force = false) {
       queueSeen = new Set(reviews.map(r => r.number))
       slowAt = Date.now()
       slowRepo = repo
-      await $.ui.log(`pr-pulse: ${repo} open=${open.length} mine-merged=${history.length} all-merged=${teamMerged.length} reviews=${reviews.length}`)
+      $.ui.log(`${repo} open=${open.length} mine-merged=${history.length} all-merged=${teamMerged.length} reviews=${reviews.length}`, { to: 'debug' })
     }
 
     const chosen: number = await read($, selectedAtom)
@@ -260,7 +266,7 @@ async function refresh($: any, force = false) {
     if (view.job) await loadSteps($, pr, view.job)
     if (view.comments) await loadComments($, pr)
   } catch (err) {
-    await $.ui.log(`pr-pulse: refresh failed: ${String((err as Error).message ?? err)}`)
+    $.ui.log(`refresh failed: ${String((err as Error).message ?? err)}`, { to: 'debug' })
     await update($, errorAtom, () => String((err as Error).message ?? err))
   }
 }
@@ -304,7 +310,8 @@ async function announcePrChanges($: any, prev: Pr | null, pr: Pr) {
   const tag = `#${pr.number}`
   const failedBefore = new Set(prev.checks.filter(isFailed).map(c => c.name))
   for (const c of pr.checks.filter(c => isFailed(c) && !failedBefore.has(c.name))) {
-    await alert($, `✗ ${c.name} failed on ${tag}`, 'fail', c.url)
+    const cancelled = c.conclusion.toUpperCase() === 'CANCELLED'
+    await alert($, `${cancelled ? '⊘' : '✗'} ${c.name} ${cancelled ? 'cancelled' : 'failed'} on ${tag}`, 'fail', c.url)
   }
   const settled = (p: Pr) => p.checks.length > 0 && !p.checks.some(isPending)
   if (!settled(prev) && settled(pr) && !pr.checks.some(isFailed)) await alert($, `✓ All checks passed on ${tag}`, 'ok', pr.url)
@@ -442,7 +449,7 @@ async function followCwd($: any, cwd: string) {
   repoCache = JSON.parse(here.stdout).nameWithOwner
   await update($, viewAtom, () => ({}))
   await update($, selectedAtom, () => 0)
-  void refresh($)
+  await refresh($)
 }
 
 async function openPanes($: any) {
@@ -470,7 +477,7 @@ async function expand($: any, number = 0) {
   }
   await update($, collapsedAtom, () => false)
   await openPanes($)
-  void refresh($)
+  await refresh($)
 }
 
 async function start($: any) {
@@ -481,7 +488,7 @@ async function start($: any) {
   await update($, repoCacheAtom, () => repoCache)
   await loadTheme($)
   await openPanes($)
-  void refresh($)
+  await refresh($)
   if (!timer) timer = $.clock.every(POLL_MS, () => void tick($))
 }
 
@@ -590,7 +597,7 @@ export const register: Register = on => {
   })
 
   on('classic.CwdChanged', async ($, e: any, next) => {
-    await $.ui.log(`pr-pulse: cwd changed to ${e.new_cwd}`)
+    $.ui.log(`cwd changed to ${e.new_cwd}`, { to: 'debug' })
     await followCwd($, String(e.new_cwd ?? ''))
     return next(e)
   })
@@ -602,7 +609,7 @@ export const register: Register = on => {
         await expand($)
         return { text: 'Expanded PR Pulse.' }
       }
-      void refresh($, true)
+      await refresh($, true)
       return { text: `Already watching ${target || repoCache || 'your latest PR'}; refreshed.` }
     }
     const url = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(arg)
@@ -611,8 +618,9 @@ export const register: Register = on => {
     await update($, viewAtom, () => ({}))
     const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
     watchedRoot = top.exitCode === 0 ? top.stdout.trim() : ''
+    const text = target ? `Watching ${target}` : repoCache ? `Watching ${repoCache}` : 'Watching your latest PR.'
     await start($)
-    return { text: target ? `Watching ${target}` : repoCache ? `Watching ${repoCache}` : 'Watching your latest PR.' }
+    return { text }
   })
 
   on('ui.close', async ($, e, next) => {
@@ -766,7 +774,11 @@ export const register: Register = on => {
       },
       { ok: pr.unresolved <= 0, label: pr.unresolved > 0 ? plural(pr.unresolved, 'unresolved thread') : 'threads resolved' },
       { ok: pr.mergeable !== 'CONFLICTING', label: pr.mergeable === 'CONFLICTING' ? 'merge conflicts' : 'no conflicts' },
-      { ok: pr.behind ? null : true, label: pr.behind ? `${plural(pr.behind, 'commit')} behind ${pr.base}` : `up to date with ${pr.base}` },
+      // behind is only a blocker when a branch rule demands up-to-date branches, which github reports as BEHIND
+      {
+        ok: !pr.behind ? true : pr.mergeState === 'BEHIND' ? false : null,
+        label: pr.behind ? `${plural(pr.behind, 'commit')} behind ${pr.base}` : `up to date with ${pr.base}`,
+      },
     ]
     const waiting = readiness.some(r => r.ok === null && r.label.includes('running'))
     // github can block on rules the checklist cannot see (signed commits, codeowners, deployments)
@@ -807,7 +819,7 @@ export const register: Register = on => {
           <Text color={t.muted}>  ·  </Text>
           <Text color={pr.isDraft ? t.muted : t.ok}>{pr.isDraft ? '○ draft' : `● ${pr.state.toLowerCase()}`}</Text>
           <Text color={t.muted}>  ·  </Text>
-          <Text color={reviewColor}>● review {review.toLowerCase().replace(/_/g, ' ')}</Text>
+          <Text color={reviewColor}>● {REVIEW_LABEL[review] ?? review.toLowerCase().replace(/_/g, ' ')}</Text>
           <Text color={t.muted}>  ·  </Text>
           <Text color={pr.mergeable === 'CONFLICTING' ? t.fail : t.muted}>{pr.mergeable.toLowerCase()}</Text>
         </Text>

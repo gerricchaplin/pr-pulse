@@ -1,0 +1,14 @@
+{
+  "name": "pr-pulse",
+  "private": true,
+  "description": "Development tooling for the PR Pulse Claude Code plugin",
+  "license": "MIT",
+  "scripts": {
+    "validate": "claude plugin validate .",
+    "test": "claude plugin test .",
+    "capabilities": "python3 scripts/check-capabilities.py"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-code": "2.1.289"
+  }
+}

@@ -1,0 +1,25 @@
+# Everything PR Pulse can hook or call in Claude Code, as `claude plugin validate` reports it.
+# CI (scripts/check-capabilities.py) fails when this changes, so any new reach is reviewed in the PR.
+# Programs it runs via $.process.run are pinned separately by the tests: gh, git, uname, open/xdg-open (https only).
+call $.clock.every
+call $.command.register
+call $.config.list
+call $.process.run
+call $.prompt.fill
+call $.prompt.read
+call $.state.get
+call $.state.set
+call $.ui.close
+call $.ui.log
+call $.ui.open
+call $.ui.resolve
+call $.ui.status
+call $.ui.toast
+hook classic.CwdChanged
+hook command.run{command=pulse}
+hook session.start
+hook ui.close
+hook ui.render{component=AbovePrompt}
+hook ui.render{component=Pane, requestId=pr-pulse-history}
+hook ui.render{component=Pane, requestId=pr-pulse-reviews}
+hook ui.render{component=Pane, requestId=pr-pulse}
