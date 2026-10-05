@@ -8,6 +8,8 @@
 
 Live GitHub pull-request status inside [Claude Code](https://claude.com/claude-code): checks, merge readiness, review comments, your review queue and change alerts, without leaving the terminal.
 
+![PR Pulse pane watching a pull request: merge-readiness verdict, check progress, recent activity and workflows](assets/pr-pulse.png)
+
 ## Install
 
 ```text
