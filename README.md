@@ -23,6 +23,8 @@ Requires the [GitHub CLI](https://cli.github.com) (`gh`), signed in (`gh auth st
 
 Run `/pulse` in a GitHub repo. Optional argument: `owner/repo`, `owner/repo#123` or a PR URL.
 
+PR Pulse opens in the same window as your Claude conversation, as three tabbed panes (PR Pulse, PR history and PR reviews), so you can keep working with Claude while it watches.
+
 - **PR Pulse pane**: your open PRs, a merge-readiness verdict (`✓ READY TO MERGE`, `✗ BLOCKED · n`, `◐ WAITING ON CHECKS`) with the checklist behind it, a check bar, failed checks first, and drill-down from workflow to job to steps with a failure-log excerpt.
 - **Comments**: unresolved review threads, the conversation and resolved threads.
 - **PR history**: your PRs and everyone's merged in the last 7 days.
