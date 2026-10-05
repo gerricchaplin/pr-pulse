@@ -1,0 +1,24 @@
+{
+  "name": "pr-pulse",
+  "owner": {
+    "name": "Gerric Chaplin",
+    "url": "https://github.com/gerricchaplin"
+  },
+  "description": "Live GitHub PR status for Claude Code.",
+  "plugins": [
+    {
+      "name": "pr-pulse",
+      "source": "./",
+      "description": "PR Pulse: live status, merge readiness, checks, comments, review queue and change alerts for your GitHub PRs, with a collapsible band",
+      "category": "productivity",
+      "keywords": [
+        "github",
+        "pull-requests",
+        "ci",
+        "code-review",
+        "notifications",
+        "statusline"
+      ]
+    }
+  ]
+}
