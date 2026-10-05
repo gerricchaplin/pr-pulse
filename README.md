@@ -1,5 +1,11 @@
 # PR Pulse
 
+[![CI](https://github.com/gerricchaplin/pr-pulse/actions/workflows/ci.yml/badge.svg)](https://github.com/gerricchaplin/pr-pulse/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/gerricchaplin/pr-pulse/actions/workflows/codeql.yml/badge.svg)](https://github.com/gerricchaplin/pr-pulse/actions/workflows/codeql.yml)
+[![Security](https://github.com/gerricchaplin/pr-pulse/actions/workflows/security.yml/badge.svg)](https://github.com/gerricchaplin/pr-pulse/actions/workflows/security.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/gerricchaplin/pr-pulse/badge)](https://scorecard.dev/viewer/?uri=github.com/gerricchaplin/pr-pulse)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6000F0.svg)](LICENSE)
+
 Live GitHub pull-request status inside [Claude Code](https://claude.com/claude-code): checks, merge readiness, review comments, your review queue and change alerts, without leaving the terminal.
 
 ## Install
@@ -25,16 +31,39 @@ Run `/pulse` in a GitHub repo. Optional argument: `owner/repo`, `owner/repo#123`
 
 Keys while a pane is focused: `r` refresh, `m` minimise, `q` close, `o` open the PR in the browser.
 
+## Security
+
+PR Pulse has no dependencies and a deliberately small reach: it runs only `gh`, `git`, `uname` and `open`/`xdg-open` (for `https://` links), never writes files, never calls a model and never sends a prompt for you. CI fails if that reach grows without review. Details, the checks this repository runs, and how to report a vulnerability: [SECURITY.md](SECURITY.md).
+
 ## GitHub API use
 
 PR Pulse polls (a local plugin cannot receive webhooks): every 15 s for your PRs and checks, every 60 s for history, the review queue and branch status. All calls are serial and go through your own `gh` token, sharing its hourly limits with everything else you run.
 
+## Try it on this repo
+
+This repository doubles as a demo target. `scripts/demo.sh <scenario>` opens a throwaway draft PR in a known state:
+
+| Scenario | What PR Pulse shows |
+|---|---|
+| `green` | all checks pass, the "✓ All checks passed" alert |
+| `fail` | a failing build with its error log, and **Fix with Claude** |
+| `slow` | a two-minute check: the pane goes from running to green |
+| `flaky` | fails, then passes after `gh run rerun --failed` without a false alert |
+| `skip` | a skipped optional check |
+| `title` | the required `pr-title` check failing |
+
+`scripts/demo.sh clean` closes them all.
+
 ## Develop
 
 ```sh
-claude plugin validate .
-claude plugin test .
+npm ci                                   # pinned Claude Code
+npx claude plugin validate .
+npx claude plugin test .
+python3 scripts/check-capabilities.py    # fails if the plugin's reach changed
 ```
+
+Guidance for contributors and coding agents: [AGENTS.md](AGENTS.md).
 
 ## License
 

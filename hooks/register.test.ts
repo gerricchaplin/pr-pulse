@@ -1,4 +1,26 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, test as kitTest } from 'claude-code/testing'
+
+// a drawing left mounted redraws after its test ends and trips the kit's leak check; unmount every one
+const mounted: { unmount: () => Promise<void> }[] = []
+
+// the plugin's whole reach on the machine: these programs, and only https links opened
+const ALLOWED_PROGRAMS = new Set(['gh', 'git', 'uname', 'open', 'xdg-open'])
+const violations: string[] = []
+const mount = async ($: any, target: any) => {
+  const m = await $.ui.mount(target)
+  mounted.push(m)
+  return m
+}
+const test = (name: string, body: ($: any, on: any) => Promise<void>) =>
+  kitTest(name, async ($, on) => {
+    violations.length = 0
+    try {
+      await body($, on)
+    } finally {
+      for (const m of mounted.splice(0)) await m.unmount().catch(() => undefined)
+    }
+    expect(violations).toEqual([])
+  })
 
 const REPO = 'acme/widgets'
 const row = (number: number, title: string) => ({
@@ -95,6 +117,8 @@ const ui_props = async (ui: any, key: string) => {
 
 const fakeGh = (argv: readonly string[]) => {
   const a = argv.join(' ')
+  if (!ALLOWED_PROGRAMS.has(argv[0]!)) violations.push(`ran ${argv[0]}`)
+  if ((argv[0] === 'open' || argv[0] === 'xdg-open') && !/^https:\/\//.test(argv[1] ?? '')) violations.push(`opened ${argv[1]}`)
   const ok = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v), stderr: '' })
   if (argv[0] === 'uname') return { exitCode: 0, stdout: 'Darwin\n', stderr: '' }
   if (argv[0] === 'open') { opened.push(argv[1]!); return { exitCode: 0, stdout: '', stderr: '' } }
@@ -170,7 +194,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const res = await $.command.run({ command: 'pulse', args: '' } as any)
     expect(res?.text).toBe('Watching your latest PR.')
 
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     expect(await ui.find({ text: /#898/ })).toBeDefined()
     expect(await ui.find({ text: /#899/ })).toBeDefined()
@@ -196,7 +220,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('clock.every', async () => ({ value: undefined }) as any)
 
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
 
     expect(await ui.find({ text: '1 failed' })).toBeDefined()
@@ -224,9 +248,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('clock.every', async () => ({ value: undefined }) as any)
 
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const pane = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const pane = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await pane.press({ key: 'refresh' })
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse-history' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse-history' })
 
     expect(await ui.find({ text: /YOUR PRS MERGED .* · 1$/ })).toBeDefined()
     expect(await ui.find({ text: /ALL PRS MERGED .* · 2$/ })).toBeDefined()
@@ -245,9 +269,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('clock.every', async () => ({ value: undefined }) as any)
 
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const pane = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const pane = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await pane.press({ key: 'refresh' })
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse-reviews' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse-reviews' })
 
     expect(await ui.find({ text: /WAITING ON YOU · 1/ })).toBeDefined()
     expect(await ui.find({ text: /WAITING ON YOUR TEAM · 1/ })).toBeDefined()
@@ -267,13 +291,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
     opened.length = 0
 
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const pane = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const pane = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await pane.press({ key: 'refresh' })
     expect((await ui_props(pane, 'open-pr'))?.variant).toBe('primary')
     await pane.press({ key: 'open-pr' })
     expect(opened).toEqual(['https://github.com/acme/widgets/pull/899'])
 
-    const reviews = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse-reviews' })
+    const reviews = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse-reviews' })
     await reviews.press({ key: 'review-open-897' })
     expect(opened[1]).toBe('https://github.com/acme/widgets/pull/897')
   })
@@ -288,7 +312,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('clock.every', async () => ({ value: undefined }) as any)
 
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     await ui.press({ key: 'comments' })
 
@@ -309,7 +333,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`shows why the PR cannot merge yet (${surface})`, async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     expect(await ui.find({ text: /✗ BLOCKED · 3/ })).toBeDefined()
     expect(await ui.find({ text: '✗ draft' })).toBeDefined()
@@ -321,7 +345,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`alerts when checks, reviews and comments change (${surface})`, async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     expect(toasts.filter(x => !x.startsWith('Draft'))).toEqual([])
 
@@ -340,7 +364,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`drafts a fix prompt for a failed check (${surface})`, async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     await ui.press({ key: 'fix-CI-lint' })
     expect(filled).toHaveLength(1)
@@ -352,7 +376,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`drafts a prompt to address a review thread (${surface})`, async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     await ui.press({ key: 'comments' })
     await ui.press({ key: 'thread-fix-0' })
@@ -370,7 +394,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       { ...CHECKS[1], startedAt: '2026-10-05T18:47:31Z' },
     ]
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     expect(await ui.find({ text: /FAILED · / })).toBeUndefined()
     expect(await ui.find({ text: '✓ 2 passed   ' })).toBeDefined()
@@ -382,7 +406,7 @@ describe('change alerts', () => {
   // first poll records, every later poll compares; `poll` is one refresh as the 15s timer would run it
   const watch = async ($: any) => {
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     const poll = async () => {
       toasts.length = 0
       await ui.press({ key: 'refresh' })
@@ -484,13 +508,13 @@ describe('collapsed band', () => {
     test(`minimise swaps the panes for a one-line summary (${surface})`, async ($, on) => {
       stub(on)
       await $.command.run({ command: 'pulse', args: '' } as any)
-      const pane = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+      const pane = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
       await pane.press({ key: 'refresh' })
       paneLog.length = 0
       await pane.press({ key: 'minimise' })
       expect(paneLog).toEqual(['close pr-pulse-reviews', 'close pr-pulse-history', 'close pr-pulse'])
 
-      const band = await $.ui.mount({ plugin: 'pr-pulse', surface, component: 'AbovePrompt', props: BAND })
+      const band = await mount($, { plugin: 'pr-pulse', surface, component: 'AbovePrompt', props: BAND })
       expect(await band.find({ text: '#899' })).toBeDefined()
       expect(await band.find({ text: ' 1 failing' })).toBeDefined()
       expect(await band.find({ text: '#898' })).toBeDefined()
@@ -509,7 +533,7 @@ describe('collapsed band', () => {
     await $.command.run({ command: 'pulse', args: '' } as any)
     let threw = false
     try {
-      await $.ui.mount({ plugin: 'pr-pulse', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+      await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'AbovePrompt', props: BAND })
     } catch {
       threw = true
     }
@@ -519,7 +543,7 @@ describe('collapsed band', () => {
   test('/pr-pulse while collapsed expands', async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const pane = await $.ui.mount({ plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await pane.press({ key: 'minimise' })
     const res = await $.command.run({ command: 'pulse', args: '' } as any)
     expect(res?.text).toBe('Expanded PR Pulse.')
@@ -528,10 +552,10 @@ describe('collapsed band', () => {
   test('alerts keep coming while collapsed and show on the band', async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const pane = await $.ui.mount({ plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await pane.press({ key: 'refresh' })
     await pane.press({ key: 'minimise' })
-    const band = await $.ui.mount({ plugin: 'pr-pulse', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+    const band = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'AbovePrompt', props: BAND })
     world.checks = [CHECKS[0], CHECKS[1], { ...CHECKS[2], status: 'COMPLETED', conclusion: 'FAILURE' }]
     toasts.length = 0
     await band.press({ key: 'expand' })
@@ -544,7 +568,7 @@ describe('collapsed band', () => {
 describe('merge readiness', () => {
   const card = async ($: any) => {
     await $.command.run({ command: 'pulse', args: '' } as any)
-    const ui = await $.ui.mount({ plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const ui = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
     await ui.press({ key: 'refresh' })
     return ui
   }
@@ -614,10 +638,19 @@ describe('merge readiness', () => {
     stub(on)
     allGreen()
     world.behind = 3
-    world.mergeState = 'BEHIND'
     const ui = await card($)
     expect(await ui.find({ text: '◐ 3 commits behind main' })).toBeDefined()
     expect(await ui.find({ text: ' ✓ READY TO MERGE ' })).toBeDefined()
+  })
+
+  test('behind main blocks when a branch rule requires up-to-date branches', async ($, on) => {
+    stub(on)
+    allGreen()
+    world.behind = 3
+    world.mergeState = 'BEHIND'
+    const ui = await card($)
+    expect(await ui.find({ text: '✗ 3 commits behind main' })).toBeDefined()
+    expect(await ui.find({ text: ' ✗ BLOCKED · 1 ' })).toBeDefined()
   })
 
   test('github blocking for a reason the checklist cannot see is not called ready', async ($, on) => {
@@ -656,4 +689,11 @@ describe('merge readiness', () => {
     expect(await ui.find({ text: '✗ draft' })).toBeDefined()
     expect(await ui.find({ text: '✗ needs approval' })).toBeDefined()
   })
+})
+
+test('the capability guard catches a program outside the allowlist', async () => {
+  fakeGh(['curl', 'https://example.com'])
+  fakeGh(['open', 'file:///etc/passwd'])
+  expect(violations).toEqual(['ran curl', 'opened file:///etc/passwd'])
+  violations.length = 0
 })

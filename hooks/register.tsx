@@ -442,7 +442,7 @@ async function followCwd($: any, cwd: string) {
   repoCache = JSON.parse(here.stdout).nameWithOwner
   await update($, viewAtom, () => ({}))
   await update($, selectedAtom, () => 0)
-  void refresh($)
+  await refresh($)
 }
 
 async function openPanes($: any) {
@@ -470,7 +470,7 @@ async function expand($: any, number = 0) {
   }
   await update($, collapsedAtom, () => false)
   await openPanes($)
-  void refresh($)
+  await refresh($)
 }
 
 async function start($: any) {
@@ -481,7 +481,7 @@ async function start($: any) {
   await update($, repoCacheAtom, () => repoCache)
   await loadTheme($)
   await openPanes($)
-  void refresh($)
+  await refresh($)
   if (!timer) timer = $.clock.every(POLL_MS, () => void tick($))
 }
 
@@ -602,7 +602,7 @@ export const register: Register = on => {
         await expand($)
         return { text: 'Expanded PR Pulse.' }
       }
-      void refresh($, true)
+      await refresh($, true)
       return { text: `Already watching ${target || repoCache || 'your latest PR'}; refreshed.` }
     }
     const url = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(arg)
@@ -611,8 +611,9 @@ export const register: Register = on => {
     await update($, viewAtom, () => ({}))
     const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
     watchedRoot = top.exitCode === 0 ? top.stdout.trim() : ''
+    const text = target ? `Watching ${target}` : repoCache ? `Watching ${repoCache}` : 'Watching your latest PR.'
     await start($)
-    return { text: target ? `Watching ${target}` : repoCache ? `Watching ${repoCache}` : 'Watching your latest PR.' }
+    return { text }
   })
 
   on('ui.close', async ($, e, next) => {
@@ -766,7 +767,11 @@ export const register: Register = on => {
       },
       { ok: pr.unresolved <= 0, label: pr.unresolved > 0 ? plural(pr.unresolved, 'unresolved thread') : 'threads resolved' },
       { ok: pr.mergeable !== 'CONFLICTING', label: pr.mergeable === 'CONFLICTING' ? 'merge conflicts' : 'no conflicts' },
-      { ok: pr.behind ? null : true, label: pr.behind ? `${plural(pr.behind, 'commit')} behind ${pr.base}` : `up to date with ${pr.base}` },
+      // behind is only a blocker when a branch rule demands up-to-date branches, which github reports as BEHIND
+      {
+        ok: !pr.behind ? true : pr.mergeState === 'BEHIND' ? false : null,
+        label: pr.behind ? `${plural(pr.behind, 'commit')} behind ${pr.base}` : `up to date with ${pr.base}`,
+      },
     ]
     const waiting = readiness.some(r => r.ok === null && r.label.includes('running'))
     // github can block on rules the checklist cannot see (signed commits, codeowners, deployments)

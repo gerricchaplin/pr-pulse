@@ -1,0 +1,87 @@
+# Deliberate check outcomes for demoing PR Pulse, steered by labels on the PR:
+#   demo:fail   the "build" job fails with a realistic error
+#   demo:slow   the "slow" job takes about two minutes
+#   demo:flaky  the "flaky" job fails on its first attempt and passes on a re-run
+#   demo:skip   the "optional" job is skipped
+# None of these are required checks.
+name: Demo
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Compile
+        env:
+          FAIL: ${{ contains(github.event.pull_request.labels.*.name, 'demo:fail') }}
+        run: |
+          echo "Compiling 3 modules…"
+          if [ "$FAIL" = "true" ]; then
+            echo "::error file=hooks/register.tsx,line=42,col=7::TS2322: Type 'string' is not assignable to type 'number'."
+            echo "hooks/register.tsx(42,7): error TS2322: Type 'string' is not assignable to type 'number'."
+            exit 1
+          fi
+          echo "Compiled 3 modules."
+
+  slow:
+    name: slow
+    if: contains(github.event.pull_request.labels.*.name, 'demo:slow')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Long-running integration suite
+        run: |
+          for i in $(seq 1 12); do echo "suite $i/12"; sleep 10; done
+
+  flaky:
+    name: flaky
+    if: contains(github.event.pull_request.labels.*.name, 'demo:flaky')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Network-dependent test
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [ "$ATTEMPT" = "1" ]; then
+            echo "::error::ECONNRESET talking to the test registry (attempt $ATTEMPT). Re-run this job."
+            exit 1
+          fi
+          echo "Passed on attempt $ATTEMPT."
+
+  optional:
+    name: optional
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'demo:skip') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: echo "Optional checks passed."
+
+  matrix:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - name: Smoke test
+        env:
+          NODE: ${{ matrix.node }}
+        run: echo "Smoke test on node $NODE passed."
