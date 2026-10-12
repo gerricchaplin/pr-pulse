@@ -15,6 +15,8 @@ export type Pr = {
   review: string
   mergeable: string
   checks: Check[]
+  // 'merge' and 'waiting': a merged PR shows the runs on its merge commit instead of the PR's own
+  checksOn: 'pr' | 'merge' | 'waiting'
   unresolved: number
   threads: number
   mergeState: string
