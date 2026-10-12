@@ -650,7 +650,16 @@ describe('collapsed band', () => {
     expect(threw).toBe(true)
   })
 
-  test('/pr-pulse while collapsed expands', async ($, on) => {
+  test('/pulse while already watching brings closed panes back', async ($, on) => {
+    stub(on)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    paneLog.length = 0
+    const res = await $.command.run({ command: 'pulse', args: '' } as any)
+    expect(res?.text).toMatch(/^Already watching/)
+    expect(paneLog).toEqual(['open pr-pulse', 'open pr-pulse-history', 'open pr-pulse-reviews'])
+  })
+
+  test('/pulse while collapsed expands', async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)
     const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })

@@ -632,6 +632,8 @@ async function resume($: any) {
   target = await read($, targetAtom)
   repoCache = await read($, repoCacheAtom)
   await loadTheme($)
+  // the reload closed the panes; reopen them unless you had minimised to the band
+  if (!(await read($, collapsedAtom))) await openPanes($)
   void refresh($, true)
   if (!timer) timer = $.clock.every(POLL_MS, () => void tick($))
 }
@@ -761,6 +763,8 @@ export const register: Register = (on, options) => {
         await expand($)
         return { text: 'Expanded PR Pulse.' }
       }
+      // a reload closes the panes while the watch carries on, so bring them back
+      await openPanes($)
       await refresh($, true)
       return { text: `Already watching ${target || repoCache || 'your latest PR'}; refreshed.` }
     }
