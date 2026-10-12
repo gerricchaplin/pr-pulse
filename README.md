@@ -44,6 +44,7 @@ PR Pulse opens in the same window as your Claude conversation, as three tabbed p
 - **Stale branches**: when a merge leaves your PR behind its base or in conflict, you get an alert and buttons beside the checklist.
   - **Merge main in** and **Rebase on main** update the branch on GitHub (`gh pr update-branch`; press twice to confirm).
   - **Rebase with Claude** drafts a prompt to rebase locally and resolve conflicts, asking before it force-pushes.
+- **Re-run** (beside each failed check from GitHub Actions): retries only the failed jobs of that run with `gh run rerun --failed`, for flaky, timed-out or cancelled jobs (press twice to confirm). A real failure needs a fix, not a re-run.
 - **Fix with Claude / Address with Claude**: drafts a prompt from a failed check's log or a review thread into your prompt box. Nothing is sent until you press Enter.
 
 ### Claude-aware
