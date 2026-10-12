@@ -663,9 +663,10 @@ async function followCwd($: any, cwd: string) {
 }
 
 async function openPanes($: any) {
-  await $.ui.open({ id: PANE, title: 'PR Pulse' })
   await $.ui.open({ id: HISTORY, title: 'PR history' })
   await $.ui.open({ id: REVIEWS, title: 'PR reviews' })
+  // opened last and asked for focus, so the PR Pulse tab is the one in front
+  await $.ui.open({ id: PANE, title: 'PR Pulse', focus: true })
 }
 
 async function closePanes($: any) {

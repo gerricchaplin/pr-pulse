@@ -107,7 +107,7 @@ const stub = (on: any) => {
   resetWorld()
   on('process.run', async (_$: any, e: any) => ({ value: fakeGh(e.argv) }))
   on('ui.open', async (_$: any, e: any) => {
-    paneLog.push(`open ${e.id}`)
+    paneLog.push(`open ${e.id}${e.focus ? ' (focus)' : ''}`)
     return { value: {} }
   })
   on('ui.close', async (_$: any, e: any) => {
@@ -689,7 +689,7 @@ describe('collapsed band', () => {
 
       paneLog.length = 0
       await band.press({ key: 'chip-open-898' })
-      expect(paneLog).toEqual(['open pr-pulse', 'open pr-pulse-history', 'open pr-pulse-reviews'])
+      expect(paneLog).toEqual(['open pr-pulse-history', 'open pr-pulse-reviews', 'open pr-pulse (focus)'])
       expect(await pane.find({ text: /▸ / })).toBeDefined()
     })
   }
@@ -712,7 +712,7 @@ describe('collapsed band', () => {
     paneLog.length = 0
     const res = await $.command.run({ command: 'pulse', args: '' } as any)
     expect(res?.text).toMatch(/^Already watching/)
-    expect(paneLog).toEqual(['open pr-pulse', 'open pr-pulse-history', 'open pr-pulse-reviews'])
+    expect(paneLog).toEqual(['open pr-pulse-history', 'open pr-pulse-reviews', 'open pr-pulse (focus)'])
   })
 
   test('/pulse while collapsed expands', async ($, on) => {
