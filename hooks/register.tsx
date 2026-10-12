@@ -45,7 +45,7 @@ let ciContext = true // userConfig: tell claude, with your next prompt, when CI 
 let me = '' // github login of the gh user
 let slowAt = 0 // when history and reviews were last fetched
 let slowRepo = ''
-let extrasAt = 0 // when required checks and behind-count were last fetched
+let extrasAt = 0 // when the behind-count was last fetched
 let extrasFor = 0
 let required: string[] = []
 let behind = 0
@@ -169,7 +169,6 @@ async function refresh($: any, force = false) {
         author: p.author?.login ?? '',
         when: String(p.mergedAt || p.closedAt || p.updatedAt || '').slice(0, 16).replace('T', ' '),
       }))
-    const fields = 'number,title,url,state,isDraft,author,mergedAt,closedAt,updatedAt'
     if (!me) me = (await gh($, ['api', 'user'])).login
     const since = new Date(Date.now() - HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10)
     const prevRepo: string = await read($, repoAtom)
@@ -178,8 +177,14 @@ async function refresh($: any, force = false) {
     const wanted: number = await read($, selectedAtom)
     const guess = [pinned, wanted].find(n => n && known.some(p => p.number === n)) || pinned || known[0]?.number || 0
     const [owner, name] = repo.split('/')
-    const fast = await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { list: `repo:${repo} is:pr is:open author:${me} sort:created-desc`, num: guess })])
-    const openRaw = (fast.data.search.nodes as any[]).filter(n => n?.number)
+    const slowDue = force || repo !== slowRepo || Date.now() - slowAt >= SLOW_POLL_MS
+    const fast = await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, {
+      list: `repo:${repo} is:pr is:open author:${me} sort:created-desc`,
+      merged: slowDue ? `repo:${repo} is:pr is:merged merged:>=${since} sort:updated-desc` : undefined,
+      queue: slowDue ? `repo:${repo} is:pr is:open review-requested:@me` : undefined,
+      num: guess,
+    })])
+    const openRaw = (fast.data.open.nodes as any[]).filter(n => n?.number)
     const open: PrRow[] = openRaw.map(n => {
       const cs = latestRuns(rollupOf(n))
       const failing = cs.filter(isFailed).length
@@ -192,17 +197,12 @@ async function refresh($: any, force = false) {
     await update($, repoAtom, () => repo)
     await update($, openAtom, () => open)
     let history: PrRow[] = await read($, historyAtom)
-    if (force || repo !== slowRepo || Date.now() - slowAt >= SLOW_POLL_MS) {
-      const teamMerged = rows(await gh($, [
-        'pr', 'list', '-R', repo, '--state', 'merged', '--search', `merged:>=${since}`, '--limit', '200', '--json', fields,
-      ])).sort((a, b) => b.when.localeCompare(a.when))
+    if (slowDue) {
+      const teamMerged = rows(fast.data.merged.nodes.filter((n: any) => n?.number)).sort((a, b) => b.when.localeCompare(a.when))
       history = teamMerged.filter(p => p.author === me)
-      const requested = await gh($, [
-        'pr', 'list', '-R', repo, '--state', 'open', '--search', 'review-requested:@me', '--limit', '100',
-        '--json', `${fields},reviewRequests`,
-      ])
+      const requested = fast.data.queue.nodes.filter((n: any) => n?.number)
       const reviews: ReviewRow[] = rows(requested).map((r, i) => {
-        const asked = (requested[i].reviewRequests ?? []) as { login?: string; slug?: string; name?: string }[]
+        const asked = (requested[i].reviewRequests?.nodes ?? []).map((q: any) => q.requestedReviewer ?? {}) as { login?: string; slug?: string; name?: string }[]
         return {
           ...r,
           direct: asked.some(q => q.login === me),
@@ -241,13 +241,6 @@ async function refresh($: any, force = false) {
     latest.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
     const lastCommenter = latest[0]?.author?.login ?? ''
     if (force || number !== extrasFor || Date.now() - extrasAt >= SLOW_POLL_MS) {
-      // `gh pr checks` exits non-zero while checks fail or run, the json is still on stdout
-      const req = await $.process.run(['gh', 'pr', 'checks', String(number), '-R', repo, '--required', '--json', 'name'], { timeoutMs: 30_000 })
-      try {
-        required = (JSON.parse(req.stdout || '[]') as { name: string }[]).map(c => c.name)
-      } catch {
-        required = []
-      }
       try {
         behind = (await gh($, ['api', `repos/${repo}/compare/${v.baseRefName}...${encodeURIComponent(v.headRefName)}`])).behind_by ?? 0
       } catch {
@@ -256,6 +249,7 @@ async function refresh($: any, force = false) {
       extrasAt = Date.now()
       extrasFor = number
     }
+    required = rollupOf(v).filter((c: any) => c.isRequired).map((c: any) => c.name ?? c.context)
     const pr: Pr = {
       repo, number, title: v.title, url: v.url, state: v.state, isDraft: v.isDraft,
       review: v.reviewDecision || 'NONE', mergeable: v.mergeable, checks, unresolved, threads,
@@ -312,25 +306,36 @@ function latestRuns(rollup: any[]): Check[] {
   }))
 }
 
-const ROLLUP = `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename
-...on CheckRun{name status conclusion detailsUrl startedAt checkSuite{workflowRun{workflow{name}}}}
-...on StatusContext{context state targetUrl createdAt}}}}}}}`
-const LIST_FIELDS = `number title url state isDraft updatedAt author{login} reviewDecision ${ROLLUP}`
+const rollup = (required: boolean) => `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename
+...on CheckRun{name status conclusion detailsUrl startedAt checkSuite{workflowRun{workflow{name}}}${required ? ' isRequired(pullRequestNumber:$num)' : ''}}
+...on StatusContext{context state targetUrl createdAt${required ? ' isRequired(pullRequestNumber:$num)' : ''}}}}}}}}`
+const ROW_FIELDS = 'number title url state isDraft updatedAt mergedAt closedAt author{login}'
+const LIST_FIELDS = `${ROW_FIELDS} reviewDecision ${rollup(false)}`
+const QUEUE_FIELDS = `${ROW_FIELDS} reviewRequests(first:20){nodes{requestedReviewer{__typename ...on User{login} ...on Team{slug name}}}}`
 const DETAIL_FIELDS = `title url state isDraft reviewDecision mergeable mergeStateStatus baseRefName headRefName
-latestReviews(first:20){nodes{author{login} state}} ${ROLLUP}
+latestReviews(first:20){nodes{author{login} state}} ${rollup(true)}
 reviewThreads(first:100){nodes{isResolved comments(last:1){totalCount nodes{author{login} createdAt}}}}
 comments(last:1){totalCount nodes{author{login} createdAt}}`
 
-// one request carries the open-PR list and the selected PR's detail; either part can be left out
-function gqlArgs(owner: string, name: string, part: { list?: string; num?: number }): string[] {
-  const decl = ['$o:String!', '$n:String!', ...(part.list ? ['$q:String!'] : []), ...(part.num ? ['$num:Int!'] : [])].join(',')
+type GqlPart = { list?: string; num?: number; merged?: string; queue?: string }
+// one request carries the open-PR list, the selected PR's detail and, when due, history and the review queue
+function gqlArgs(owner: string, name: string, part: GqlPart): string[] {
+  const search = (alias: string, v: string, fields: string) => `${alias}:search(query:${v},type:ISSUE,first:${alias === 'open' ? 20 : 100}){nodes{...on PullRequest{${fields}}}}`
+  const decl = [
+    '$o:String!', '$n:String!',
+    ...(part.list ? ['$q:String!'] : []), ...(part.merged ? ['$mq:String!'] : []), ...(part.queue ? ['$rq:String!'] : []),
+    ...(part.num ? ['$num:Int!'] : []),
+  ].join(',')
   const body = [
     part.num ? `repository(owner:$o,name:$n){pullRequest(number:$num){${DETAIL_FIELDS}}}` : 'repository(owner:$o,name:$n){id}',
-    part.list ? `search(query:$q,type:ISSUE,first:20){nodes{...on PullRequest{${LIST_FIELDS}}}}` : '',
+    part.list ? search('open', '$q', LIST_FIELDS) : '',
+    part.merged ? search('merged', '$mq', ROW_FIELDS) : '',
+    part.queue ? search('queue', '$rq', QUEUE_FIELDS) : '',
   ].join('\n')
   return [
     '-f', `query=query(${decl}){${body}}`, '-f', `o=${owner}`, '-f', `n=${name}`,
-    ...(part.list ? ['-f', `q=${part.list}`] : []), ...(part.num ? ['-F', `num=${part.num}`] : []),
+    ...(part.list ? ['-f', `q=${part.list}`] : []), ...(part.merged ? ['-f', `mq=${part.merged}`] : []),
+    ...(part.queue ? ['-f', `rq=${part.queue}`] : []), ...(part.num ? ['-F', `num=${part.num}`] : []),
   ]
 }
 

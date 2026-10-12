@@ -136,13 +136,6 @@ const fakeGh = (argv: readonly string[]) => {
   if (argv[0] === 'git' && argv.includes('--abbrev-ref')) return { exitCode: 0, stdout: `${localBranch}\n`, stderr: '' }
   if (argv[0] === 'git') return { exitCode: 0, stdout: '/repo\n', stderr: '' }
   if (a.startsWith('gh repo view')) return ok({ nameWithOwner: REPO })
-  if (a.includes('review-requested:@me')) return ok(world.queue)
-  if (a.startsWith('gh pr list') && a.includes('--state merged')) {
-    return ok([
-      { ...row(890, 'mine merged'), state: 'MERGED', author: { login: 'me' }, mergedAt: '2026-10-04T10:00:00Z' },
-      { ...row(891, 'theirs merged'), state: 'MERGED', author: { login: 'someone' }, mergedAt: '2026-10-05T10:00:00Z' },
-    ])
-  }
   if (a === 'gh api user') return ok({ login: 'me' })
   if (a.startsWith('gh pr list')) return ok([])
   if (a.startsWith('gh pr view')) return ok({ url: row(899, '').url })
@@ -152,12 +145,13 @@ const fakeGh = (argv: readonly string[]) => {
     world.behind = 0
     return { exitCode: 0, stdout: '', stderr: '' }
   }
-  if (a.startsWith('gh pr checks')) return { exitCode: 1, stdout: JSON.stringify(world.required.map(name => ({ name }))), stderr: '' }
   if (a.startsWith('gh api repos/') && a.includes('/compare/')) return ok({ behind_by: world.behind })
-  if (a.startsWith('gh api graphql') && (a.includes('mergeStateStatus') || a.includes('search(query:$q'))) {
+  if (a.startsWith('gh api graphql') && (a.includes('mergeStateStatus') || a.includes('open:search(query:$q'))) {
     graphqlCalls.push(a)
     const withRollup = (checks: any[]) => ({
-      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks.map(c => ({ ...c, checkSuite: { workflowRun: { workflow: { name: c.workflowName } } } })) } } } }] },
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks.map(c => ({
+        ...c, checkSuite: { workflowRun: { workflow: { name: c.workflowName } } }, isRequired: world.required.includes(c.name),
+      })) } } } }] },
     })
     const listed = (r: any, extra: object) => ({ ...r, author: { login: 'me' }, ...extra })
     const detail = () => ({
@@ -170,8 +164,22 @@ const fakeGh = (argv: readonly string[]) => {
     })
     const data: any = {}
     if (a.includes('pullRequest(number:$num)')) data.repository = { pullRequest: detail() }
-    if (a.includes('search(query:$q')) {
-      data.search = { nodes: [
+    if (a.includes('merged:search')) {
+      data.merged = { nodes: [
+        { ...row(890, 'mine merged'), state: 'MERGED', author: { login: 'me' }, mergedAt: '2026-10-04T10:00:00Z' },
+        { ...row(891, 'theirs merged'), state: 'MERGED', author: { login: 'someone' }, mergedAt: '2026-10-05T10:00:00Z' },
+      ] }
+    }
+    if (a.includes('queue:search')) {
+      data.queue = { nodes: world.queue.map((r: any) => ({
+        ...r,
+        reviewRequests: { nodes: r.reviewRequests.map((q: any) => ({
+          requestedReviewer: q.login ? { __typename: 'User', login: q.login } : { __typename: 'Team', slug: q.slug, name: q.slug },
+        })) },
+      })) }
+    }
+    if (a.includes('open:search(query:$q')) {
+      data.open = { nodes: [
         listed(row(899, 'test 2'), { reviewDecision: 'REVIEW_REQUIRED', ...withRollup([CHECKS[0], CHECKS[1]]) }),
         listed(row(898, 'test 1'), { isDraft: false, reviewDecision: 'APPROVED', ...withRollup([CHECKS[1]]) }),
       ] }
@@ -935,7 +943,7 @@ describe('CI-aware agent', () => {
 
 describe('adaptive polling', () => {
   // own clock: the shared wrapper stubs clock.now, and a second hook for it would not load
-  const listCalls = (calls: string[]) => calls.filter(a => a.startsWith('gh api graphql') && a.includes('search(query:$q')).length
+  const listCalls = (calls: string[]) => calls.filter(a => a.startsWith('gh api graphql') && a.includes('open:search(query:$q')).length
   const watch = async ($: any, on: any, rate?: { limited: boolean }) => {
     const calls: string[] = []
     const clock = mock.clock(on)
@@ -968,6 +976,16 @@ describe('adaptive polling', () => {
     expect(listCalls(calls)).toBe(settled)
     await clock.advance(15_000)
     expect(listCalls(calls)).toBe(settled + 1)
+  })
+
+  kitTest('a forced refresh needs one GraphQL request and the behind-count, nothing else', async ($, on) => {
+    resetWorld()
+    const { calls } = await watch($, on)
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const before = calls.length
+    await pane.press({ key: 'refresh' })
+    const made = calls.slice(before).map(c => (c.startsWith('gh api graphql') ? 'graphql' : c.split(' ').slice(0, 3).join(' ')))
+    expect(made).toEqual(['graphql', 'gh api repos/acme/widgets/compare/main...feature%2Fwidget-sizes'])
   })
 
   kitTest('stretches idle polling to 120s while minimised to the band', async ($, on) => {
