@@ -27,6 +27,10 @@ export type Pr = {
   latestReviews: { author: string; state: string }[]
   commentCount: number
   lastCommenter: string
+  autoMerge: string
+  canAutoMerge: boolean
+  canCancelAutoMerge: boolean
+  mergeMethod: string
 }
 export type Armed = { key: string; at: number }
 export type Alert = { at: number; text: string; tone: 'ok' | 'fail' | 'run' | 'info'; url: string }

@@ -231,7 +231,8 @@ async function refresh($: any, force = false) {
       throw new Error(`No PRs of yours in ${repo}`)
     }
     await update($, selectedAtom, () => number)
-    const v = number === guess ? fast.data.repository.pullRequest : (await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { num: number })])).data.repository.pullRequest
+    const detail = number === guess ? fast.data.repository : (await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { num: number })])).data.repository
+    const v = detail.pullRequest
     if (!v) throw new Error(`#${number} not found in ${repo}`)
     // once merged, what matters is what ran on the merge commit; before those runs appear, say so
     let checks = latestRuns(rollupOf(v))
@@ -269,6 +270,10 @@ async function refresh($: any, force = false) {
       mergeState: v.mergeStateStatus ?? 'UNKNOWN', base: v.baseRefName ?? 'main', head: v.headRefName ?? '', behind, required,
       latestReviews: (v.latestReviews?.nodes ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
       commentCount, lastCommenter,
+      autoMerge: v.autoMergeRequest?.mergeMethod ?? '',
+      canAutoMerge: !!v.viewerCanEnableAutoMerge && !v.isDraft,
+      canCancelAutoMerge: !!v.viewerCanDisableAutoMerge,
+      mergeMethod: mergeMethodOf(detail),
     }
     const prev: Pr | null = await read($, prAtom)
     await update($, prAtom, () => pr)
@@ -326,7 +331,7 @@ const rollup = (required: boolean) => `commits(last:1){nodes{commit{statusCheckR
 const ROW_FIELDS = 'number title url state isDraft updatedAt mergedAt closedAt author{login}'
 const LIST_FIELDS = `${ROW_FIELDS} reviewDecision ${rollup(false)}`
 const QUEUE_FIELDS = `${ROW_FIELDS} reviewRequests(first:20){nodes{requestedReviewer{__typename ...on User{login} ...on Team{slug name}}}}`
-const DETAIL_FIELDS = `title url state isDraft mergedAt mergeCommit{statusCheckRollup{${contexts(false)}}} reviewDecision mergeable mergeStateStatus baseRefName headRefName
+const DETAIL_FIELDS = `title url state isDraft mergedAt mergeCommit{statusCheckRollup{${contexts(false)}}} autoMergeRequest{mergeMethod} viewerCanEnableAutoMerge viewerCanDisableAutoMerge reviewDecision mergeable mergeStateStatus baseRefName headRefName
 latestReviews(first:20){nodes{author{login} state}} ${rollup(true)}
 reviewThreads(first:100){nodes{isResolved comments(last:1){totalCount nodes{author{login} createdAt}}}}
 comments(last:1){totalCount nodes{author{login} createdAt}}`
@@ -341,7 +346,7 @@ function gqlArgs(owner: string, name: string, part: GqlPart): string[] {
     ...(part.num ? ['$num:Int!'] : []),
   ].join(',')
   const body = [
-    part.num ? `repository(owner:$o,name:$n){pullRequest(number:$num){${DETAIL_FIELDS}}}` : 'repository(owner:$o,name:$n){id}',
+    part.num ? `repository(owner:$o,name:$n){squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed pullRequest(number:$num){${DETAIL_FIELDS}}}` : 'repository(owner:$o,name:$n){id}',
     part.list ? search('open', '$q', LIST_FIELDS) : '',
     part.merged ? search('merged', '$mq', ROW_FIELDS) : '',
     part.queue ? search('queue', '$rq', QUEUE_FIELDS) : '',
@@ -351,6 +356,11 @@ function gqlArgs(owner: string, name: string, part: GqlPart): string[] {
     ...(part.list ? ['-f', `q=${part.list}`] : []), ...(part.merged ? ['-f', `mq=${part.merged}`] : []),
     ...(part.queue ? ['-f', `rq=${part.queue}`] : []), ...(part.num ? ['-F', `num=${part.num}`] : []),
   ]
+}
+
+// the repo's allowed way to merge, preferring squash; an empty string when it allows none
+function mergeMethodOf(repo: { squashMergeAllowed?: boolean; mergeCommitAllowed?: boolean; rebaseMergeAllowed?: boolean }): string {
+  return repo.squashMergeAllowed ? 'squash' : repo.mergeCommitAllowed ? 'merge' : repo.rebaseMergeAllowed ? 'rebase' : ''
 }
 
 // gh's own rollup shape, which latestRuns already reads
@@ -587,6 +597,27 @@ async function rerunFailed($: any, pr: Pr, c: Check) {
     await refresh($, true)
   } finally {
     rerunning = false
+  }
+}
+
+let merging = false // one auto-merge change at a time
+
+async function setAutoMerge($: any, pr: Pr, enable: boolean) {
+  if (merging) return
+  merging = true
+  try {
+    const r = await $.process.run(
+      ['gh', 'pr', 'merge', String(pr.number), '-R', pr.repo, ...(enable ? ['--auto', `--${pr.mergeMethod}`] : ['--disable-auto'])],
+      { timeoutMs: 60_000 },
+    )
+    if (r.exitCode !== 0) {
+      $.ui.toast(`Couldn't ${enable ? 'enable' : 'cancel'} auto-merge on #${pr.number}: ${(r.stderr || r.stdout || 'gh failed').trim().split('\n')[0]}`, { timeoutMs: 8000 })
+      return
+    }
+    $.ui.toast(enable ? `Auto-merge on for #${pr.number}: it merges (${pr.mergeMethod}) once required checks pass` : `Auto-merge cancelled on #${pr.number}`, { timeoutMs: 8000 })
+    await refresh($, true)
+  } finally {
+    merging = false
   }
 }
 
@@ -1065,6 +1096,30 @@ export const register: Register = (on, options) => {
         <Button key="rebase-claude" label="✦ Rebase with Claude" onPress={() => void rebaseWithClaude($, pr)} />
       </Box>
     ) : null
+    const autoMergeActions =
+      pr.state !== 'OPEN' ? null
+      : pr.autoMerge ? (
+        <Box flexDirection="row" flexWrap="wrap" gap={1} marginTop={1}>
+          <Text color={t.ok}>⚡ auto-merge on ({pr.autoMerge.toLowerCase()})</Text>
+          {pr.canCancelAutoMerge && (
+            <Button
+              key="auto-merge-off"
+              label={isArmed(armed, `automerge-off-${pr.number}`) ? `Press again to cancel auto-merge on #${pr.number}` : '✕ Cancel auto-merge'}
+              onPress={() => void confirmThen($, `automerge-off-${pr.number}`, () => setAutoMerge($, pr, false))}
+            />
+          )}
+        </Box>
+      )
+      : pr.canAutoMerge && pr.mergeMethod ? (
+        <Box flexDirection="row" flexWrap="wrap" gap={1} marginTop={1}>
+          <Button
+            key="auto-merge-on"
+            label={isArmed(armed, `automerge-on-${pr.number}`) ? `Press again to ${pr.mergeMethod}-merge #${pr.number} once checks pass` : '⚡ Auto-merge when checks pass'}
+            onPress={() => void confirmThen($, `automerge-on-${pr.number}`, () => setAutoMerge($, pr, true))}
+          />
+        </Box>
+      )
+      : null
 
     const card = (
       <Box flexDirection="column" borderStyle="round" borderColor={t.brand} paddingX={1} marginTop={1}>
@@ -1092,6 +1147,7 @@ export const register: Register = (on, options) => {
         </Box>
         {readinessLine}
         {branchActions}
+        {autoMergeActions}
         <Text color={t.muted}>updated {new Date(loaded).toLocaleTimeString()} · auto-refresh {POLL_MS / 1000}s</Text>
         {errorLine}
       </Box>
