@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Alert, Check, Comment, Pr, PrRow, ReviewRow, Step, Thread, View } from '../types'
+import type { Alert, Armed, Check, Comment, Pr, PrRow, ReviewRow, Step, Thread, View } from '../types'
 
 const PANE = 'pr-pulse'
 const HISTORY = 'pr-pulse-history'
@@ -29,6 +29,7 @@ const targetAtom = atom({ plugin: 'pr-pulse', key: 'target' } as const, '')
 const repoCacheAtom = atom({ plugin: 'pr-pulse', key: 'repoCache' } as const, '')
 const followedAtom = atom({ plugin: 'pr-pulse', key: 'followed' } as const, [] as string[])
 const notesAtom = atom({ plugin: 'pr-pulse', key: 'notes' } as const, [] as string[])
+const armedAtom = atom({ plugin: 'pr-pulse', key: 'armed' } as const, { key: '', at: 0 } as Armed)
 const collapsedAtom = atom({ plugin: 'pr-pulse', key: 'collapsed' } as const, false)
 const alertsAtom = atom({ plugin: 'pr-pulse', key: 'alerts' } as const, [] as Alert[])
 const selectedAtom = atom({ plugin: 'pr-pulse', key: 'selected' } as const, 0)
@@ -258,7 +259,7 @@ async function refresh($: any, force = false) {
     const pr: Pr = {
       repo, number, title: v.title, url: v.url, state: v.state, isDraft: v.isDraft,
       review: v.reviewDecision || 'NONE', mergeable: v.mergeable, checks, unresolved, threads,
-      mergeState: v.mergeStateStatus ?? 'UNKNOWN', base: v.baseRefName ?? 'main', behind, required,
+      mergeState: v.mergeStateStatus ?? 'UNKNOWN', base: v.baseRefName ?? 'main', head: v.headRefName ?? '', behind, required,
       latestReviews: (v.latestReviews ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
       commentCount, lastCommenter,
     }
@@ -397,6 +398,12 @@ async function announcePrChanges($: any, prev: Pr | null, pr: Pr) {
     const n = pr.commentCount - prev.commentCount
     await alert($, `💬 ${n} new comment${n === 1 ? '' : 's'} on ${tag} from ${pr.lastCommenter}`, 'info', pr.url)
   }
+  if (pr.state === 'OPEN' && !prev.behind && pr.behind > 0) {
+    await alert($, `⇣ ${tag} is ${pr.behind} commit${pr.behind === 1 ? '' : 's'} behind ${pr.base}`, pr.mergeState === 'BEHIND' ? 'fail' : 'info', pr.url)
+  }
+  if (pr.state === 'OPEN' && prev.mergeable !== 'CONFLICTING' && pr.mergeable === 'CONFLICTING') {
+    await alert($, `✗ ${tag} has merge conflicts with ${pr.base}`, 'fail', pr.url)
+  }
   if (prev.mergeState !== 'CLEAN' && pr.mergeState === 'CLEAN') await alert($, `● ${tag} is ready to merge`, 'ok', pr.url)
   if (prev.state !== pr.state && pr.state === 'MERGED') await alert($, `⑂ ${tag} merged`, 'ok', pr.url)
   if (prev.state !== pr.state && pr.state === 'CLOSED') await alert($, `⊘ ${tag} closed`, 'fail', pr.url)
@@ -486,6 +493,61 @@ async function addressThread($: any, pr: Pr, th: Thread) {
     `Address this review thread on PR #${pr.number} (${th.url}) at \`${th.path}${th.line ? `:${th.line}` : ''}\`:`,
     quoted,
     'Make the change if it is right, or tell me why not. Summarise what you did so I can reply on the thread.',
+  ].join('\n'))
+}
+
+let updating = false // one branch update at a time; a second press while it runs is ignored
+const CONFIRM_MS = 5000
+
+const isArmed = (armed: Armed, key: string) => armed.key === key && Date.now() - armed.at < CONFIRM_MS
+
+// first press arms and redraws the button as "press again"; the second press within CONFIRM_MS runs it
+async function confirmThen($: any, key: string, run: () => Promise<void>) {
+  const armed: Armed = await read($, armedAtom)
+  if (!isArmed(armed, key)) {
+    await update($, armedAtom, () => ({ key, at: Date.now() }))
+    return
+  }
+  await update($, armedAtom, () => ({ key: '', at: 0 }))
+  await run()
+}
+
+// github updates the branch server-side; a rebase rewrites it, so a local checkout must pull before pushing again
+async function updateBranch($: any, pr: Pr, rebase: boolean) {
+  if (updating) return
+  updating = true
+  try {
+    $.ui.toast(rebase ? `Rebasing #${pr.number} on ${pr.base}…` : `Merging ${pr.base} into #${pr.number}…`)
+    const r = await $.process.run(
+      ['gh', 'pr', 'update-branch', String(pr.number), '-R', pr.repo, ...(rebase ? ['--rebase'] : [])],
+      { timeoutMs: 60_000 },
+    )
+    if (r.exitCode !== 0) {
+      $.ui.toast(`Couldn't update #${pr.number}: ${(r.stderr || r.stdout || 'gh failed').trim().split('\n')[0]}`, { timeoutMs: 8000 })
+      return
+    }
+    const local = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])
+    const onBranch = local.exitCode === 0 && local.stdout.trim() === pr.head
+    const done = rebase ? `Rebased #${pr.number} on ${pr.base}` : `Merged ${pr.base} into #${pr.number}`
+    $.ui.toast(
+      onBranch ? `${done}: your checkout is on ${pr.head}, run \`git pull${rebase ? ' --rebase' : ''}\` before pushing again` : done,
+      { timeoutMs: 8000 },
+    )
+    await refresh($, true)
+  } finally {
+    updating = false
+  }
+}
+
+async function rebaseWithClaude($: any, pr: Pr) {
+  const conflicts = pr.mergeable === 'CONFLICTING'
+  const state = [pr.behind ? `${pr.behind} commit${pr.behind === 1 ? '' : 's'} behind \`${pr.base}\`` : '', conflicts ? 'has merge conflicts' : '']
+    .filter(Boolean)
+    .join(' and ')
+  await draftPrompt($, [
+    `PR #${pr.number} in ${pr.repo} (${pr.url}) is ${state}.`,
+    `Rebase \`${pr.head}\` onto the latest \`origin/${pr.base}\`: fetch, check out the branch, rebase, and resolve any conflicts keeping the intent of both sides.`,
+    'Run the tests, then show me what changed and ask before you push with `--force-with-lease`.',
   ].join('\n'))
 }
 
@@ -898,6 +960,29 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
+    // github can only update a branch without conflicts; with them, a local rebase is the way
+    const conflicting = pr.mergeable === 'CONFLICTING'
+    const armed: Armed = await read($, armedAtom)
+    const branchActions = pr.state === 'OPEN' && (pr.behind > 0 || conflicting) ? (
+      <Box flexDirection="row" flexWrap="wrap" gap={1} marginTop={1}>
+        {!conflicting && (
+          <Button
+            key="update-merge"
+            label={isArmed(armed, `merge-${pr.number}`) ? `Press again to merge ${pr.base} into #${pr.number}` : `⇣ Merge ${pr.base} in`}
+            onPress={() => void confirmThen($, `merge-${pr.number}`, () => updateBranch($, pr, false))}
+          />
+        )}
+        {!conflicting && (
+          <Button
+            key="update-rebase"
+            label={isArmed(armed, `rebase-${pr.number}`) ? `Press again to rebase #${pr.number} on ${pr.base}` : `⇣ Rebase on ${pr.base}`}
+            onPress={() => void confirmThen($, `rebase-${pr.number}`, () => updateBranch($, pr, true))}
+          />
+        )}
+        <Button key="rebase-claude" label="✦ Rebase with Claude" onPress={() => void rebaseWithClaude($, pr)} />
+      </Box>
+    ) : null
+
     const card = (
       <Box flexDirection="column" borderStyle="round" borderColor={t.brand} paddingX={1} marginTop={1}>
         <Box flexDirection="row" gap={1}>
@@ -923,6 +1008,7 @@ export const register: Register = (on, options) => {
           />
         </Box>
         {readinessLine}
+        {branchActions}
         <Text color={t.muted}>updated {new Date(loaded).toLocaleTimeString()} · auto-refresh {POLL_MS / 1000}s</Text>
         {errorLine}
       </Box>

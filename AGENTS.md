@@ -24,7 +24,7 @@ All three must pass before a PR. `claude plugin test` must exit 0 with no "file 
 ## Rules
 
 - **Keep the reach small.** Only run `gh`, `git`, `uname`, `open`/`xdg-open`; only open `https://` URLs; never write files, call models or `$.prompt.submit`. The `tool.call` hook only observes Claude's Bash commands after `next(e)`; it must return what `next` returned, unchanged. Context goes only on a prompt the person sends, and only while the `ciContext` setting is on. If a change needs a new hook or `$` call, update `capabilities.txt` in the same PR and say why in the description.
-- **Every GitHub call goes through `gh`**, serially. Mind the rate limits: fast data every 15 s, slow data every 60 s.
+- **Every GitHub call goes through `gh`**, serially. Only `gh pr update-branch` writes, and only behind the two-press confirm (`confirmThen`); any new write needs the same. Mind the rate limits: fast data every 15 s, slow data every 60 s.
 - **UI:** no bold text; colours come from the `theme` object (dark and light variants). Button labels go in the `label` prop, never as multiple children.
 - **No `on` or `$` shadowing:** never name a local variable `on`.
 - **Tests:** add or update a test for every behaviour change; cover terminal and desktop surfaces for UI.

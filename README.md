@@ -30,6 +30,7 @@ PR Pulse opens in the same window as your Claude conversation, as three tabbed p
 - **PR history**: your PRs and everyone's merged in the last 7 days.
 - **PR reviews**: PRs waiting on you, and on your teams.
 - **Alerts**: toasts and a recent-activity list when a check fails or all pass, a review lands, someone comments, the PR becomes ready to merge, or a review is requested from you.
+- **Stale branches**: when a merge leaves your PR behind its base, or in conflict with it, you get an alert and buttons beside the checklist: **Merge main in** or **Rebase on main** update the branch on GitHub (`gh pr update-branch`; press twice to confirm), and **Rebase with Claude** drafts a prompt to rebase locally and resolve conflicts, asking before it force-pushes.
 - **Fix with Claude / Address with Claude**: drafts a prompt from a failed check's log or a review thread into your prompt box. Nothing is sent until you press Enter.
 - **CI-aware Claude**: when Claude runs `gh pr create` or `git push`, PR Pulse follows that PR (as the band, if it was not open). If a check then fails on it, a short note with the failure log is added to **your next prompt**, so Claude already knows; a one-line note follows when CI is green again. Every note shows in Recent activity first, and nothing is sent on its own.
 - **Minimise** (`m`): the panes collapse to a one-line band above the prompt; polling and alerts carry on. `/pulse` or `e` expands.
