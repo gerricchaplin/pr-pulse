@@ -172,14 +172,22 @@ async function refresh($: any, force = false) {
     const fields = 'number,title,url,state,isDraft,author,mergedAt,closedAt,updatedAt'
     if (!me) me = (await gh($, ['api', 'user'])).login
     const since = new Date(Date.now() - HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10)
-    const openRaw = await gh($, [
-      'pr', 'list', '-R', repo, '--author', '@me', '--state', 'open', '--limit', '20', '--json', `${fields},reviewDecision,statusCheckRollup`,
-    ])
-    const open: PrRow[] = rows(openRaw).map((r, i) => {
-      const cs = latestRuns(openRaw[i].statusCheckRollup ?? [])
+    const prevRepo: string = await read($, repoAtom)
+    const pinned = target ? Number(/#(\d+)$/.exec(target)![1]) : 0
+    const known: PrRow[] = prevRepo === repo ? [...(await read($, openAtom)), ...(await read($, historyAtom))] : []
+    const wanted: number = await read($, selectedAtom)
+    const guess = [pinned, wanted].find(n => n && known.some(p => p.number === n)) || pinned || known[0]?.number || 0
+    const [owner, name] = repo.split('/')
+    const fast = await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { list: `repo:${repo} is:pr is:open author:${me} sort:created-desc`, num: guess })])
+    const openRaw = (fast.data.search.nodes as any[]).filter(n => n?.number)
+    const open: PrRow[] = openRaw.map(n => {
+      const cs = latestRuns(rollupOf(n))
       const failing = cs.filter(isFailed).length
       const checks = !cs.length ? 'none' : failing ? 'failed' : cs.some(isPending) ? 'running' : 'passed'
-      return { ...r, checks, failing, review: openRaw[i].reviewDecision || 'NONE' }
+      return {
+        number: n.number, title: n.title, url: n.url, state: n.state, isDraft: !!n.isDraft, author: n.author?.login ?? '',
+        when: String(n.updatedAt ?? '').slice(0, 16).replace('T', ' '), checks, failing, review: n.reviewDecision || 'NONE',
+      }
     })
     await update($, repoAtom, () => repo)
     await update($, openAtom, () => open)
@@ -216,36 +224,22 @@ async function refresh($: any, force = false) {
     }
 
     const chosen: number = await read($, selectedAtom)
-    const pinned = target ? Number(/#(\d+)$/.exec(target)![1]) : 0
     const number = [pinned, chosen].find(n => n && [...open, ...history].some(p => p.number === n)) || pinned || open[0]?.number || history[0]?.number
     if (!number) {
       await update($, prAtom, () => null)
       throw new Error(`No PRs of yours in ${repo}`)
     }
     await update($, selectedAtom, () => number)
-    const v = await gh($, [
-      'pr', 'view', String(number), '-R', repo, '--json',
-      'title,url,state,isDraft,reviewDecision,mergeable,mergeStateStatus,baseRefName,headRefName,latestReviews,statusCheckRollup',
-    ])
-    const checks = latestRuns(v.statusCheckRollup ?? [])
-    let unresolved = 0
-    let threads = 0
-    let commentCount = 0
-    let lastCommenter = ''
-    try {
-      const [owner, name] = repo.split('/')
-      const g = await gh($, ['api', 'graphql', '-f', `query=${COUNTS_QUERY}`, '-f', `o=${owner}`, '-f', `n=${name}`, '-F', `num=${number}`])
-      const p = g.data.repository.pullRequest
-      const nodes = p.reviewThreads.nodes as { isResolved: boolean; comments: { totalCount: number; nodes: Latest[] } }[]
-      threads = nodes.length
-      unresolved = nodes.filter(n => !n.isResolved).length
-      commentCount = p.comments.totalCount + nodes.reduce((a, n) => a + n.comments.totalCount, 0)
-      const latest = [...p.comments.nodes, ...nodes.flatMap(n => n.comments.nodes)] as Latest[]
-      latest.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-      lastCommenter = latest[0]?.author?.login ?? ''
-    } catch {
-      unresolved = -1
-    }
+    const v = number === guess ? fast.data.repository.pullRequest : (await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { num: number })])).data.repository.pullRequest
+    if (!v) throw new Error(`#${number} not found in ${repo}`)
+    const checks = latestRuns(rollupOf(v))
+    const nodes = v.reviewThreads.nodes as { isResolved: boolean; comments: { totalCount: number; nodes: Latest[] } }[]
+    const threads = nodes.length
+    const unresolved = nodes.filter(n => !n.isResolved).length
+    const commentCount = v.comments.totalCount + nodes.reduce((a, n) => a + n.comments.totalCount, 0)
+    const latest = [...v.comments.nodes, ...nodes.flatMap(n => n.comments.nodes)] as Latest[]
+    latest.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    const lastCommenter = latest[0]?.author?.login ?? ''
     if (force || number !== extrasFor || Date.now() - extrasAt >= SLOW_POLL_MS) {
       // `gh pr checks` exits non-zero while checks fail or run, the json is still on stdout
       const req = await $.process.run(['gh', 'pr', 'checks', String(number), '-R', repo, '--required', '--json', 'name'], { timeoutMs: 30_000 })
@@ -266,7 +260,7 @@ async function refresh($: any, force = false) {
       repo, number, title: v.title, url: v.url, state: v.state, isDraft: v.isDraft,
       review: v.reviewDecision || 'NONE', mergeable: v.mergeable, checks, unresolved, threads,
       mergeState: v.mergeStateStatus ?? 'UNKNOWN', base: v.baseRefName ?? 'main', head: v.headRefName ?? '', behind, required,
-      latestReviews: (v.latestReviews ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
+      latestReviews: (v.latestReviews?.nodes ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
       commentCount, lastCommenter,
     }
     const prev: Pr | null = await read($, prAtom)
@@ -318,9 +312,34 @@ function latestRuns(rollup: any[]): Check[] {
   }))
 }
 
-const COUNTS_QUERY = `query($o:String!,$n:String!,$num:Int!){repository(owner:$o,name:$n){pullRequest(number:$num){
+const ROLLUP = `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename
+...on CheckRun{name status conclusion detailsUrl startedAt checkSuite{workflowRun{workflow{name}}}}
+...on StatusContext{context state targetUrl createdAt}}}}}}}`
+const LIST_FIELDS = `number title url state isDraft updatedAt author{login} reviewDecision ${ROLLUP}`
+const DETAIL_FIELDS = `title url state isDraft reviewDecision mergeable mergeStateStatus baseRefName headRefName
+latestReviews(first:20){nodes{author{login} state}} ${ROLLUP}
 reviewThreads(first:100){nodes{isResolved comments(last:1){totalCount nodes{author{login} createdAt}}}}
-comments(last:1){totalCount nodes{author{login} createdAt}}}}}`
+comments(last:1){totalCount nodes{author{login} createdAt}}`
+
+// one request carries the open-PR list and the selected PR's detail; either part can be left out
+function gqlArgs(owner: string, name: string, part: { list?: string; num?: number }): string[] {
+  const decl = ['$o:String!', '$n:String!', ...(part.list ? ['$q:String!'] : []), ...(part.num ? ['$num:Int!'] : [])].join(',')
+  const body = [
+    part.num ? `repository(owner:$o,name:$n){pullRequest(number:$num){${DETAIL_FIELDS}}}` : 'repository(owner:$o,name:$n){id}',
+    part.list ? `search(query:$q,type:ISSUE,first:20){nodes{...on PullRequest{${LIST_FIELDS}}}}` : '',
+  ].join('\n')
+  return [
+    '-f', `query=query(${decl}){${body}}`, '-f', `o=${owner}`, '-f', `n=${name}`,
+    ...(part.list ? ['-f', `q=${part.list}`] : []), ...(part.num ? ['-F', `num=${part.num}`] : []),
+  ]
+}
+
+// gh's own rollup shape, which latestRuns already reads
+function rollupOf(pr: any): any[] {
+  const nodes = pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []
+  return nodes.map((c: any) => (c.__typename === 'CheckRun' ? { ...c, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '' } : c))
+}
+
 type Latest = { author?: { login: string }; createdAt?: string }
 
 // a failing check on a PR claude opened or pushed to becomes context on your next prompt, never a prompt of its own
