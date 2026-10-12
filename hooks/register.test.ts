@@ -53,6 +53,8 @@ let localBranch = 'main'
 
 // what GitHub reports; a test mutates it between refreshes to raise alerts
 const world = {
+  mergeChecks: null as any[] | null,
+  mergedAt: '2026-10-05T10:00:00Z',
   checks: CHECKS as any[],
   latestReviews: [] as { author: { login: string }; state: string }[],
   commentTotal: 1,
@@ -69,6 +71,8 @@ const world = {
 }
 const resetWorld = () => {
   world.checks = CHECKS
+  world.mergeChecks = null
+  world.mergedAt = '2026-10-05T10:00:00Z'
   world.latestReviews = []
   world.commentTotal = 1
   world.lastCommenter = 'github-actions'
@@ -155,6 +159,8 @@ const fakeGh = (argv: readonly string[]) => {
     })
     const listed = (r: any, extra: object) => ({ ...r, author: { login: 'me' }, ...extra })
     const detail = () => ({
+      mergedAt: world.mergedAt,
+      mergeCommit: world.prState === 'MERGED' ? { statusCheckRollup: world.mergeChecks ? { contexts: { nodes: world.mergeChecks.map(c => ({ ...c, checkSuite: { workflowRun: { workflow: { name: c.workflowName } } } })) } } : null } : null,
       title: 'test 2', url: row(899, '').url, state: world.prState, isDraft: world.isDraft, reviewDecision: world.review, mergeable: world.mergeable,
       mergeStateStatus: world.mergeState, baseRefName: 'main', headRefName: 'feature/widget-sizes',
       latestReviews: { nodes: world.latestReviews },
@@ -830,6 +836,42 @@ describe('merge readiness', () => {
     expect(await ui.find({ text: ' ✗ BLOCKED · 2 ' })).toBeDefined()
     expect(await ui.find({ text: '✗ draft' })).toBeDefined()
     expect(await ui.find({ text: '✗ needs approval' })).toBeDefined()
+  })
+})
+
+describe('after merge', () => {
+  const card = async ($: any) => {
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    return ui
+  }
+  const apply = (conclusion: string) => job('apply', 'COMPLETED', conclusion, 9)
+
+  test('a merged PR shows the runs on its merge commit', async ($, on) => {
+    stub(on)
+    world.prState = 'MERGED'
+    world.mergeChecks = [apply('FAILURE')]
+    const ui = await card($)
+    expect(await ui.find({ text: 'AFTER MERGE' })).toBeDefined()
+    expect(await ui.find({ text: '1 failed' })).toBeDefined()
+    expect(await ui.find({ text: 'apply · CI ›' })).toBeDefined()
+  })
+
+  test('says it is waiting while the merge commit has no runs yet', async ($, on) => {
+    stub(on)
+    world.prState = 'MERGED'
+    world.mergedAt = new Date().toISOString()
+    const ui = await card($)
+    expect(await ui.find({ text: 'waiting for runs on the merge commit' })).toBeDefined()
+  })
+
+  test('falls back to the PR checks when the repo runs nothing after merge', async ($, on) => {
+    stub(on)
+    world.prState = 'MERGED'
+    const ui = await card($)
+    expect(await ui.find({ text: 'CHECKS' })).toBeDefined()
+    expect(await ui.find({ text: '1 failed' })).toBeDefined()
   })
 })
 

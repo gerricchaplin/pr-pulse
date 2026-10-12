@@ -12,6 +12,7 @@ const SLOW_POLL_MS = 60_000 // history and review queue change slowly
 const IDLE_POLL_MS = 60_000 // nothing is running, so nothing changes quickly
 const MINIMISED_IDLE_POLL_MS = 120_000 // band only and nothing running: alerts can wait a little
 const BACKOFF_MAX_MS = 300_000
+const POST_MERGE_WAIT_MS = 120_000 // runs on the merge commit start a few seconds after the merge
 const RATE_LIMITED = /rate limit|abuse detection|secondary rate/i
 
 const prAtom = atom({ plugin: 'pr-pulse', key: 'pr' } as const, null as Pr | null)
@@ -232,7 +233,19 @@ async function refresh($: any, force = false) {
     await update($, selectedAtom, () => number)
     const v = number === guess ? fast.data.repository.pullRequest : (await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { num: number })])).data.repository.pullRequest
     if (!v) throw new Error(`#${number} not found in ${repo}`)
-    const checks = latestRuns(rollupOf(v))
+    // once merged, what matters is what ran on the merge commit; before those runs appear, say so
+    let checks = latestRuns(rollupOf(v))
+    let checksOn: Pr['checksOn'] = 'pr'
+    if (v.state === 'MERGED' && v.mergeCommit) {
+      const post = latestRuns(contextsOf(v.mergeCommit.statusCheckRollup))
+      if (post.length) {
+        checks = post
+        checksOn = 'merge'
+      } else if (Date.now() - Date.parse(v.mergedAt) < POST_MERGE_WAIT_MS) {
+        checks = []
+        checksOn = 'waiting'
+      }
+    }
     const nodes = v.reviewThreads.nodes as { isResolved: boolean; comments: { totalCount: number; nodes: Latest[] } }[]
     const threads = nodes.length
     const unresolved = nodes.filter(n => !n.isResolved).length
@@ -249,10 +262,10 @@ async function refresh($: any, force = false) {
       extrasAt = Date.now()
       extrasFor = number
     }
-    required = rollupOf(v).filter((c: any) => c.isRequired).map((c: any) => c.name ?? c.context)
+    required = checksOn === 'pr' ? rollupOf(v).filter((c: any) => c.isRequired).map((c: any) => c.name ?? c.context) : []
     const pr: Pr = {
       repo, number, title: v.title, url: v.url, state: v.state, isDraft: v.isDraft,
-      review: v.reviewDecision || 'NONE', mergeable: v.mergeable, checks, unresolved, threads,
+      review: v.reviewDecision || 'NONE', mergeable: v.mergeable, checks, checksOn, unresolved, threads,
       mergeState: v.mergeStateStatus ?? 'UNKNOWN', base: v.baseRefName ?? 'main', head: v.headRefName ?? '', behind, required,
       latestReviews: (v.latestReviews?.nodes ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
       commentCount, lastCommenter,
@@ -268,7 +281,7 @@ async function refresh($: any, force = false) {
       `PR #${number} ${pr.state.toLowerCase()}${unresolved > 0 ? ` · ${unresolved} unresolved` : ''} · ${failed ? `${failed} failed` : running ? `${running} running` : 'checks ok'}`,
     )
     failures = 0
-    const busy = running > 0 || open.some(r => r.checks === 'running')
+    const busy = running > 0 || pr.checksOn === 'waiting' || open.some(r => r.checks === 'running')
     const idleMs = (await read($, collapsedAtom)) ? MINIMISED_IDLE_POLL_MS : IDLE_POLL_MS
     nextPollAt = (await $.clock.now()) + (busy ? POLL_MS : idleMs)
     const view: View = await read($, viewAtom)
@@ -306,13 +319,14 @@ function latestRuns(rollup: any[]): Check[] {
   }))
 }
 
-const rollup = (required: boolean) => `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename
+const contexts = (required: boolean) => `contexts(first:100){nodes{__typename
 ...on CheckRun{name status conclusion detailsUrl startedAt checkSuite{workflowRun{workflow{name}}}${required ? ' isRequired(pullRequestNumber:$num)' : ''}}
-...on StatusContext{context state targetUrl createdAt${required ? ' isRequired(pullRequestNumber:$num)' : ''}}}}}}}}`
+...on StatusContext{context state targetUrl createdAt${required ? ' isRequired(pullRequestNumber:$num)' : ''}}}}`
+const rollup = (required: boolean) => `commits(last:1){nodes{commit{statusCheckRollup{${contexts(required)}}}}}`
 const ROW_FIELDS = 'number title url state isDraft updatedAt mergedAt closedAt author{login}'
 const LIST_FIELDS = `${ROW_FIELDS} reviewDecision ${rollup(false)}`
 const QUEUE_FIELDS = `${ROW_FIELDS} reviewRequests(first:20){nodes{requestedReviewer{__typename ...on User{login} ...on Team{slug name}}}}`
-const DETAIL_FIELDS = `title url state isDraft reviewDecision mergeable mergeStateStatus baseRefName headRefName
+const DETAIL_FIELDS = `title url state isDraft mergedAt mergeCommit{statusCheckRollup{${contexts(false)}}} reviewDecision mergeable mergeStateStatus baseRefName headRefName
 latestReviews(first:20){nodes{author{login} state}} ${rollup(true)}
 reviewThreads(first:100){nodes{isResolved comments(last:1){totalCount nodes{author{login} createdAt}}}}
 comments(last:1){totalCount nodes{author{login} createdAt}}`
@@ -341,7 +355,11 @@ function gqlArgs(owner: string, name: string, part: GqlPart): string[] {
 
 // gh's own rollup shape, which latestRuns already reads
 function rollupOf(pr: any): any[] {
-  const nodes = pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []
+  return contextsOf(pr.commits?.nodes?.[0]?.commit?.statusCheckRollup)
+}
+
+function contextsOf(rollup: any): any[] {
+  const nodes = rollup?.contexts?.nodes ?? []
   return nodes.map((c: any) => (c.__typename === 'CheckRun' ? { ...c, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '' } : c))
 }
 
@@ -1196,9 +1214,9 @@ export const register: Register = (on, options) => {
         {openSection}
         {card}
         <Box marginTop={1} flexDirection="row" gap={1}>
-          <Text color={t.accent}>CHECKS</Text>
+          <Text color={t.accent}>{pr.checksOn === 'pr' ? 'CHECKS' : 'AFTER MERGE'}</Text>
           {bar(counts, total)}
-          <Text color={t.muted}>{done}/{total}</Text>
+          <Text color={t.muted}>{pr.checksOn === 'waiting' ? 'waiting for runs on the merge commit' : `${done}/${total}`}</Text>
         </Box>
         {tally(counts)}
         {alerts.length > 0 && (
