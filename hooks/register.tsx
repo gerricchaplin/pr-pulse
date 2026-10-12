@@ -27,12 +27,16 @@ const commentsLoadedAtom = atom({ plugin: 'pr-pulse', key: 'commentsLoaded' } as
 const watchingAtom = atom({ plugin: 'pr-pulse', key: 'watching' } as const, false)
 const targetAtom = atom({ plugin: 'pr-pulse', key: 'target' } as const, '')
 const repoCacheAtom = atom({ plugin: 'pr-pulse', key: 'repoCache' } as const, '')
+const followedAtom = atom({ plugin: 'pr-pulse', key: 'followed' } as const, [] as string[])
+const notesAtom = atom({ plugin: 'pr-pulse', key: 'notes' } as const, [] as string[])
 const collapsedAtom = atom({ plugin: 'pr-pulse', key: 'collapsed' } as const, false)
 const alertsAtom = atom({ plugin: 'pr-pulse', key: 'alerts' } as const, [] as Alert[])
 const selectedAtom = atom({ plugin: 'pr-pulse', key: 'selected' } as const, 0)
 
 let target = '' // "owner/repo#N" pinned by /pr-pulse <arg>; empty = latest PR of mine
 let repoCache = '' // repo of the session's cwd, else of my latest PR
+let autoFollow = true // userConfig: follow the PRs claude opens or pushes to
+let ciContext = true // userConfig: tell claude, with your next prompt, when CI fails on a followed PR
 let me = '' // github login of the gh user
 let slowAt = 0 // when history and reviews were last fetched
 let slowRepo = ''
@@ -105,6 +109,12 @@ const REVIEW_LABEL: Record<string, string> = {
   NONE: 'no review needed',
 }
 const ALERTS_KEPT = 8
+const FOLLOWED_KEPT = 20
+const NOTES_KEPT = 5
+const NOTE_CHARS = 1500
+const PR_URL = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/
+const CREATES_PR = /\bgh\s+pr\s+create\b/
+const PUSHES = /\bgit\s+push\b/
 const BAND_ALERT_MS = 60_000 // how long the newest alert stays on the collapsed band
 const BODY_CHARS = 700
 const BODY_LINES = 10
@@ -299,6 +309,66 @@ reviewThreads(first:100){nodes{isResolved comments(last:1){totalCount nodes{auth
 comments(last:1){totalCount nodes{author{login} createdAt}}}}}`
 type Latest = { author?: { login: string }; createdAt?: string }
 
+// a failing check on a PR claude opened or pushed to becomes context on your next prompt, never a prompt of its own
+async function noteForClaude($: any, prev: Pr, pr: Pr, failedBefore: Set<string>) {
+  if (!ciContext || !(await read($, followedAtom)).includes(`${pr.repo}#${pr.number}`)) return
+  const tag = `PR #${pr.number} (${pr.url})`
+  for (const c of pr.checks.filter(c => isFailed(c) && !failedBefore.has(c.name) && c.conclusion.toUpperCase() !== 'CANCELLED')) {
+    const log = await fetchFailureLog($, pr, c)
+    const note = [
+      `PR Pulse: the "${c.name}" check (${c.workflow}) failed on ${tag}, which you opened or pushed to.`,
+      log.length ? `Log excerpt:\n${log.join('\n')}` : `Logs: ${c.url}`,
+    ].join('\n').slice(0, NOTE_CHARS)
+    await queueNote($, note, `✦ Will tell Claude at your next prompt: ${c.name} failed on #${pr.number}`, c.url)
+  }
+  const green = (p: Pr) => p.checks.length > 0 && !p.checks.some(isPending) && !p.checks.some(isFailed)
+  if (failedBefore.size && green(pr) && !green(prev)) {
+    await queueNote($, `PR Pulse: CI is green again on ${tag}.`, `✦ Will tell Claude at your next prompt: CI green again on #${pr.number}`, pr.url)
+  }
+}
+
+async function queueNote($: any, note: string, shown: string, url: string) {
+  await update($, notesAtom, (list: string[]) => [...list.filter(n => n !== note), note].slice(-NOTES_KEPT))
+  await alert($, shown, 'info', url)
+}
+
+// claude's own `gh pr create` or `git push`: follow the PR it opened or updated
+async function followFromCommand($: any, command: string, output: string) {
+  let found = CREATES_PR.test(command) ? PR_URL.exec(output) : null
+  if (!found && PUSHES.test(command)) {
+    const r = await $.process.run(['gh', 'pr', 'view', '--json', 'url'], { timeoutMs: 30_000 })
+    if (r.exitCode !== 0) return
+    try {
+      found = PR_URL.exec(JSON.parse(r.stdout).url ?? '')
+    } catch {
+      return
+    }
+  }
+  if (found) await follow($, found[1]!, Number(found[2]), CREATES_PR.test(command) ? 'opened' : 'pushed to')
+}
+
+async function follow($: any, repo: string, number: number, verb: string) {
+  const key = `${repo}#${number}`
+  const isNew = !(await read($, followedAtom)).includes(key)
+  await update($, followedAtom, (list: string[]) => [key, ...list.filter(k => k !== key)].slice(0, FOLLOWED_KEPT))
+  target = ''
+  repoCache = repo
+  await update($, targetAtom, () => target)
+  await update($, repoCacheAtom, () => repoCache)
+  await update($, selectedAtom, () => number)
+  await update($, viewAtom, () => ({}))
+  if (!running) {
+    // started by claude rather than by you: stay out of the way as the band until expanded
+    running = true
+    await update($, watchingAtom, () => true)
+    await update($, collapsedAtom, () => true)
+    await loadTheme($)
+    if (!timer) timer = $.clock.every(POLL_MS, () => void tick($))
+  }
+  if (isNew) $.ui.toast(`PR Pulse is following #${number}, which Claude just ${verb}`, { timeoutMs: 6000 })
+  await refresh($, true)
+}
+
 async function alert($: any, text: string, tone: Alert['tone'], url = '') {
   $.ui.toast(text, { timeoutMs: 8000 })
   await update($, alertsAtom, (list: Alert[]) => [{ at: Date.now(), text, tone, url }, ...list].slice(0, ALERTS_KEPT))
@@ -315,6 +385,7 @@ async function announcePrChanges($: any, prev: Pr | null, pr: Pr) {
   }
   const settled = (p: Pr) => p.checks.length > 0 && !p.checks.some(isPending)
   if (!settled(prev) && settled(pr) && !pr.checks.some(isFailed)) await alert($, `✓ All checks passed on ${tag}`, 'ok', pr.url)
+  await noteForClaude($, prev, pr, failedBefore)
   const before = new Map(prev.latestReviews.map(r => [r.author, r.state]))
   for (const r of pr.latestReviews) {
     if (r.author === me || before.get(r.author) === r.state) continue
@@ -586,7 +657,26 @@ function heading(ui: any, label: string, count: number, color = theme.accent) {
   )
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  autoFollow = options.autoFollow !== false
+  ciContext = options.ciContext !== false
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (!autoFollow || ran.deny !== undefined || ran.isError || !(CREATES_PR.test(e.command) || PUSHES.test(e.command))) return ran
+    const result = ran.result as { stdout?: string; stderr?: string; backgroundTaskId?: string } | undefined
+    if (!result || result.backgroundTaskId) return ran
+    await followFromCommand($, e.command, `${result.stdout ?? ''}\n${result.stderr ?? ''}`)
+    return ran
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    const notes: string[] = await read($, notesAtom)
+    if (!ciContext || !notes.length) return next(e)
+    await update($, notesAtom, () => [])
+    return next({ ...e, context: [...(e.context ?? []), ...notes] })
+  })
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pulse',

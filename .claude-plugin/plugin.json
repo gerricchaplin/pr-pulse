@@ -17,5 +17,19 @@
     "statusline"
   ],
   "homepage": "https://github.com/gerricchaplin/pr-pulse",
-  "repository": "https://github.com/gerricchaplin/pr-pulse"
+  "repository": "https://github.com/gerricchaplin/pr-pulse",
+  "userConfig": {
+    "autoFollow": {
+      "type": "boolean",
+      "title": "Follow the PRs Claude opens",
+      "description": "After Claude runs gh pr create or git push, watch that pull request (starting as the band if PR Pulse was not open).",
+      "default": true
+    },
+    "ciContext": {
+      "type": "boolean",
+      "title": "Tell Claude when CI fails",
+      "description": "When a check fails on a PR Claude opened or pushed to, add a short note with the failure log to your next prompt. Nothing is sent on its own.",
+      "default": true
+    }
+  }
 }

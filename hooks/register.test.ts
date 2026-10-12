@@ -11,8 +11,10 @@ const mount = async ($: any, target: any) => {
   mounted.push(m)
   return m
 }
-const test = (name: string, body: ($: any, on: any) => Promise<void>) =>
-  kitTest(name, async ($, on) => {
+type Body = ($: any, on: any) => Promise<void>
+const test = (name: string, a: Body | { options: Record<string, boolean> }, b?: Body) => {
+  const [opts, body] = typeof a === 'function' ? [undefined, a] : [a, b!]
+  const run = async ($: any, on: any) => {
     violations.length = 0
     try {
       await body($, on)
@@ -20,7 +22,9 @@ const test = (name: string, body: ($: any, on: any) => Promise<void>) =>
       for (const m of mounted.splice(0)) await m.unmount().catch(() => undefined)
     }
     expect(violations).toEqual([])
-  })
+  }
+  return opts ? kitTest(name, opts, run) : kitTest(name, run)
+}
 
 const REPO = 'acme/widgets'
 const row = (number: number, title: string) => ({
@@ -711,4 +715,105 @@ test('the capability guard catches a program outside the allowlist', async () =>
   fakeGh(['open', 'file:///etc/passwd'])
   expect(violations).toEqual(['ran curl', 'opened file:///etc/passwd'])
   violations.length = 0
+})
+
+describe('CI-aware agent', () => {
+  // the engine beneath the plugin: what Claude's Bash call returned, and the prompt as it reached the model
+  const agent = (on: any, stdout = '') => {
+    const seen: { context?: readonly string[] }[] = []
+    on('tool.call', async (_$: any, e: any) =>
+      e.command.startsWith('false')
+        ? { result: { stdout: '', stderr: 'boom', interrupted: false }, isError: true }
+        : { result: { stdout, stderr: '', interrupted: false } },
+    )
+    on('prompt.submit', async (_$: any, e: any) => {
+      seen.push({ context: e.context })
+      return { text: e.text, context: e.context }
+    })
+    return seen
+  }
+  const claudeRuns = ($: any, command: string) => $.tool.call({ tool: 'Bash', command })
+
+  test('follows the PR Claude opens, starting as the band', async ($, on) => {
+    stub(on)
+    agent(on, 'https://github.com/acme/widgets/pull/898\n')
+    await claudeRuns($, 'gh pr create --fill')
+    expect(toasts).toContain('PR Pulse is following #898, which Claude just opened')
+    const band = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 140 } })
+    expect(await band.find({ text: '#898' })).toBeDefined()
+  })
+
+  test('follows the PR for the branch Claude pushes', async ($, on) => {
+    stub(on)
+    agent(on, '')
+    await claudeRuns($, 'git push -u origin HEAD')
+    expect(toasts).toContain('PR Pulse is following #899, which Claude just pushed to')
+  })
+
+  test('ignores failed commands and unrelated ones', async ($, on) => {
+    stub(on)
+    agent(on, 'https://github.com/acme/widgets/pull/898\n')
+    await claudeRuns($, 'false && gh pr create')
+    await claudeRuns($, 'echo https://github.com/acme/widgets/pull/898')
+    expect(toasts).toEqual([])
+  })
+
+  test('a CI failure on a followed PR reaches Claude once, with the log', async ($, on) => {
+    stub(on)
+    const seen = agent(on, 'https://github.com/acme/widgets/pull/899\n')
+    await claudeRuns($, 'gh pr create --fill')
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    world.checks = [CHECKS[0], CHECKS[1], { ...CHECKS[2], status: 'COMPLETED', conclusion: 'FAILURE' }]
+    await pane.press({ key: 'refresh' })
+    expect(toasts).toContain('✦ Will tell Claude at your next prompt: plan failed on #899')
+
+    await $.prompt.submit({ text: 'what next?' })
+    await $.prompt.submit({ text: 'and now?' })
+    const note = (seen[0]!.context ?? []).join('\n')
+    expect(note).toContain('the "plan" check (CI) failed on PR #899')
+    expect(note).toContain('Error: unknown attribute "foo"')
+    expect(seen[1]!.context ?? []).toEqual([])
+  })
+
+  test('says when a followed PR is green again', async ($, on) => {
+    stub(on)
+    const seen = agent(on, 'https://github.com/acme/widgets/pull/899\n')
+    world.checks = [{ ...CHECKS[1] }, { ...CHECKS[2], status: 'COMPLETED', conclusion: 'FAILURE' }]
+    await claudeRuns($, 'gh pr create --fill')
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    world.checks = [{ ...CHECKS[1] }, { ...CHECKS[2], status: 'COMPLETED', conclusion: 'SUCCESS' }]
+    await pane.press({ key: 'refresh' })
+    await $.prompt.submit({ text: 'status?' })
+    expect((seen[0]!.context ?? []).join('\n')).toContain('CI is green again on PR #899')
+  })
+
+  test('PRs Claude did not touch never reach its context', async ($, on) => {
+    stub(on)
+    const seen = agent(on)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await pane.press({ key: 'refresh' })
+    world.checks = [CHECKS[0], CHECKS[1], { ...CHECKS[2], status: 'COMPLETED', conclusion: 'FAILURE' }]
+    await pane.press({ key: 'refresh' })
+    await $.prompt.submit({ text: 'hi' })
+    expect(seen[0]!.context ?? []).toEqual([])
+  })
+
+  test('ciContext off keeps Claude out of it', { options: { ciContext: false } }, async ($, on) => {
+    stub(on)
+    const seen = agent(on, 'https://github.com/acme/widgets/pull/899\n')
+    await claudeRuns($, 'gh pr create --fill')
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    world.checks = [CHECKS[0], CHECKS[1], { ...CHECKS[2], status: 'COMPLETED', conclusion: 'FAILURE' }]
+    await pane.press({ key: 'refresh' })
+    await $.prompt.submit({ text: 'hi' })
+    expect(seen[0]!.context ?? []).toEqual([])
+  })
+
+  test('autoFollow off ignores what Claude runs', { options: { autoFollow: false } }, async ($, on) => {
+    stub(on)
+    agent(on, 'https://github.com/acme/widgets/pull/898\n')
+    await claudeRuns($, 'gh pr create --fill')
+    expect(toasts).toEqual([])
+  })
 })

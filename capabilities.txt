@@ -17,7 +17,9 @@ call $.ui.status
 call $.ui.toast
 hook classic.CwdChanged
 hook command.run{command=pulse}
+hook prompt.submit
 hook session.start
+hook tool.call{tool=Bash}
 hook ui.close
 hook ui.render{component=AbovePrompt}
 hook ui.render{component=Pane, requestId=pr-pulse-history}
