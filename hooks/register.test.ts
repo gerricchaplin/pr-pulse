@@ -1,4 +1,4 @@
-import { describe, expect, test as kitTest } from 'claude-code/testing'
+import { describe, expect, mock, test as kitTest } from 'claude-code/testing'
 
 // a drawing left mounted redraws after its test ends and trips the kit's leak check; unmount every one
 const mounted: { unmount: () => Promise<void> }[] = []
@@ -16,6 +16,7 @@ const test = (name: string, a: Body | { options: Record<string, boolean> }, b?: 
   const [opts, body] = typeof a === 'function' ? [undefined, a] : [a, b!]
   const run = async ($: any, on: any) => {
     violations.length = 0
+    on('clock.now', async () => ({ value: Date.now() }) as any)
     try {
       await body($, on)
     } finally {
@@ -42,6 +43,7 @@ const CHECKS = [
   job('plan', 'IN_PROGRESS', '', 4),
 ]
 
+const graphqlCalls: string[] = []
 const opened: string[] = []
 const filled: string[] = []
 const toasts: string[] = []
@@ -83,6 +85,7 @@ const resetWorld = () => {
     { ...row(895, 'needs team'), author: { login: 'bob' }, reviewRequests: [{ slug: 'acme/team-platform' }, { login: 'other' }] },
   ]
   opened.length = 0
+  graphqlCalls.length = 0
   filled.length = 0
   toasts.length = 0
   paneLog.length = 0
@@ -133,41 +136,55 @@ const fakeGh = (argv: readonly string[]) => {
   if (argv[0] === 'git' && argv.includes('--abbrev-ref')) return { exitCode: 0, stdout: `${localBranch}\n`, stderr: '' }
   if (argv[0] === 'git') return { exitCode: 0, stdout: '/repo\n', stderr: '' }
   if (a.startsWith('gh repo view')) return ok({ nameWithOwner: REPO })
-  if (a.includes('review-requested:@me')) return ok(world.queue)
-  if (a.startsWith('gh pr list') && a.includes('--state open')) {
-    return ok([
-      { ...row(899, 'test 2'), reviewDecision: 'REVIEW_REQUIRED', statusCheckRollup: [CHECKS[0], CHECKS[1]] },
-      { ...row(898, 'test 1'), isDraft: false, reviewDecision: 'APPROVED', statusCheckRollup: [CHECKS[1]] },
-    ])
-  }
-  if (a.startsWith('gh pr list') && a.includes('--state merged')) {
-    return ok([
-      { ...row(890, 'mine merged'), state: 'MERGED', author: { login: 'me' }, mergedAt: '2026-10-04T10:00:00Z' },
-      { ...row(891, 'theirs merged'), state: 'MERGED', author: { login: 'someone' }, mergedAt: '2026-10-05T10:00:00Z' },
-    ])
-  }
   if (a === 'gh api user') return ok({ login: 'me' })
   if (a.startsWith('gh pr list')) return ok([])
-  if (a.startsWith('gh pr view')) {
-    return ok({
-      title: 'test 2', url: row(899, '').url, state: world.prState, isDraft: world.isDraft, reviewDecision: world.review, mergeable: world.mergeable,
-      mergeStateStatus: world.mergeState, baseRefName: 'main', headRefName: 'feature/widget-sizes',
-      latestReviews: world.latestReviews, statusCheckRollup: world.checks,
-    })
-  }
+  if (a.startsWith('gh pr view')) return ok({ url: row(899, '').url })
   if (a.startsWith('gh pr update-branch')) {
     branchUpdates.push(a)
     if (world.mergeable === 'CONFLICTING') return { exitCode: 1, stdout: '', stderr: 'merge conflict between base and head\n' }
     world.behind = 0
     return { exitCode: 0, stdout: '', stderr: '' }
   }
-  if (a.startsWith('gh pr checks')) return { exitCode: 1, stdout: JSON.stringify(world.required.map(name => ({ name }))), stderr: '' }
   if (a.startsWith('gh api repos/') && a.includes('/compare/')) return ok({ behind_by: world.behind })
-  if (a.startsWith('gh api graphql') && a.includes('totalCount')) {
-    return ok({ data: { repository: { pullRequest: {
+  if (a.startsWith('gh api graphql') && (a.includes('mergeStateStatus') || a.includes('open:search(query:$q'))) {
+    graphqlCalls.push(a)
+    const withRollup = (checks: any[]) => ({
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks.map(c => ({
+        ...c, checkSuite: { workflowRun: { workflow: { name: c.workflowName } } }, isRequired: world.required.includes(c.name),
+      })) } } } }] },
+    })
+    const listed = (r: any, extra: object) => ({ ...r, author: { login: 'me' }, ...extra })
+    const detail = () => ({
+      title: 'test 2', url: row(899, '').url, state: world.prState, isDraft: world.isDraft, reviewDecision: world.review, mergeable: world.mergeable,
+      mergeStateStatus: world.mergeState, baseRefName: 'main', headRefName: 'feature/widget-sizes',
+      latestReviews: { nodes: world.latestReviews },
+      ...withRollup(world.checks),
       reviewThreads: { nodes: Array.from({ length: world.unresolved }, () => ({ isResolved: false, comments: { totalCount: 1, nodes: [] } })) },
       comments: { totalCount: world.commentTotal, nodes: [{ author: { login: world.lastCommenter }, createdAt: '2026-10-05T19:00:00Z' }] },
-    } } } })
+    })
+    const data: any = {}
+    if (a.includes('pullRequest(number:$num)')) data.repository = { pullRequest: detail() }
+    if (a.includes('merged:search')) {
+      data.merged = { nodes: [
+        { ...row(890, 'mine merged'), state: 'MERGED', author: { login: 'me' }, mergedAt: '2026-10-04T10:00:00Z' },
+        { ...row(891, 'theirs merged'), state: 'MERGED', author: { login: 'someone' }, mergedAt: '2026-10-05T10:00:00Z' },
+      ] }
+    }
+    if (a.includes('queue:search')) {
+      data.queue = { nodes: world.queue.map((r: any) => ({
+        ...r,
+        reviewRequests: { nodes: r.reviewRequests.map((q: any) => ({
+          requestedReviewer: q.login ? { __typename: 'User', login: q.login } : { __typename: 'Team', slug: q.slug, name: q.slug },
+        })) },
+      })) }
+    }
+    if (a.includes('open:search(query:$q')) {
+      data.open = { nodes: [
+        listed(row(899, 'test 2'), { reviewDecision: 'REVIEW_REQUIRED', ...withRollup([CHECKS[0], CHECKS[1]]) }),
+        listed(row(898, 'test 1'), { isDraft: false, reviewDecision: 'APPROVED', ...withRollup([CHECKS[1]]) }),
+      ] }
+    }
+    return ok({ data })
   }
   if (a.includes('--log-failed')) {
     return { exitCode: 0, stdout: 'lint\tRun tflint\t2026-10-05T18:35:40.1Z Error: unknown attribute "foo"\n', stderr: '' }
@@ -921,5 +938,80 @@ describe('CI-aware agent', () => {
     agent(on, 'https://github.com/acme/widgets/pull/898\n')
     await claudeRuns($, 'gh pr create --fill')
     expect(toasts).toEqual([])
+  })
+})
+
+describe('adaptive polling', () => {
+  // own clock: the shared wrapper stubs clock.now, and a second hook for it would not load
+  const listCalls = (calls: string[]) => calls.filter(a => a.startsWith('gh api graphql') && a.includes('open:search(query:$q')).length
+  const watch = async ($: any, on: any, rate?: { limited: boolean }) => {
+    const calls: string[] = []
+    const clock = mock.clock(on)
+    on('process.run', async (_$: any, e: any) => {
+      calls.push(e.argv.join(' '))
+      if (rate?.limited && e.argv[0] === 'gh' && e.argv[1] === 'api' && e.argv[2] === 'graphql') return { value: { exitCode: 1, stdout: '', stderr: 'API rate limit exceeded' } }
+      return { value: fakeGh(e.argv) }
+    })
+    on('ui.open', async () => ({ value: {} }) as any)
+    on('ui.close', async () => ({ value: undefined }) as any)
+    on('ui.status', async () => ({ value: undefined }) as any)
+    on('ui.log', async () => ({ value: undefined }) as any)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    return { calls, clock }
+  }
+
+  kitTest('polls every 15s while checks run, then slows to 60s once they finish', async ($, on) => {
+    resetWorld()
+    const { calls, clock } = await watch($, on)
+    const first = listCalls(calls)
+    const spawned = calls.length
+    await clock.advance(15_000)
+    expect(listCalls(calls)).toBe(first + 1)
+    expect(calls.length).toBe(spawned + 1)
+
+    world.checks = CHECKS.map(c => ({ ...c, status: 'COMPLETED', conclusion: 'SUCCESS' }))
+    await clock.advance(15_000)
+    const settled = listCalls(calls)
+    await clock.advance(45_000)
+    expect(listCalls(calls)).toBe(settled)
+    await clock.advance(15_000)
+    expect(listCalls(calls)).toBe(settled + 1)
+  })
+
+  kitTest('a forced refresh needs one GraphQL request and the behind-count, nothing else', async ($, on) => {
+    resetWorld()
+    const { calls } = await watch($, on)
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    const before = calls.length
+    await pane.press({ key: 'refresh' })
+    const made = calls.slice(before).map(c => (c.startsWith('gh api graphql') ? 'graphql' : c.split(' ').slice(0, 3).join(' ')))
+    expect(made).toEqual(['graphql', 'gh api repos/acme/widgets/compare/main...feature%2Fwidget-sizes'])
+  })
+
+  kitTest('stretches idle polling to 120s while minimised to the band', async ($, on) => {
+    resetWorld()
+    world.checks = CHECKS.map(c => ({ ...c, status: 'COMPLETED', conclusion: 'SUCCESS' }))
+    const { calls, clock } = await watch($, on)
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await pane.press({ key: 'minimise' })
+    await clock.advance(60_000)
+    const settled = listCalls(calls)
+    await clock.advance(105_000)
+    expect(listCalls(calls)).toBe(settled)
+    await clock.advance(15_000)
+    expect(listCalls(calls)).toBe(settled + 1)
+  })
+
+  kitTest('backs off after a rate-limit error and recovers on success', async ($, on) => {
+    resetWorld()
+    const rate = { limited: true }
+    const { calls, clock } = await watch($, on, rate)
+    const first = listCalls(calls)
+    await clock.advance(30_000)
+    expect(listCalls(calls)).toBe(first)
+
+    rate.limited = false
+    await clock.advance(30_000)
+    expect(listCalls(calls)).toBe(first + 1)
   })
 })

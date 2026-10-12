@@ -9,6 +9,10 @@ const REVIEWS = 'pr-pulse-reviews'
 const POLL_MS = 15_000
 const HISTORY_DAYS = 7
 const SLOW_POLL_MS = 60_000 // history and review queue change slowly
+const IDLE_POLL_MS = 60_000 // nothing is running, so nothing changes quickly
+const MINIMISED_IDLE_POLL_MS = 120_000 // band only and nothing running: alerts can wait a little
+const BACKOFF_MAX_MS = 300_000
+const RATE_LIMITED = /rate limit|abuse detection|secondary rate/i
 
 const prAtom = atom({ plugin: 'pr-pulse', key: 'pr' } as const, null as Pr | null)
 const errorAtom = atom({ plugin: 'pr-pulse', key: 'error' } as const, '')
@@ -41,12 +45,14 @@ let ciContext = true // userConfig: tell claude, with your next prompt, when CI 
 let me = '' // github login of the gh user
 let slowAt = 0 // when history and reviews were last fetched
 let slowRepo = ''
-let extrasAt = 0 // when required checks and behind-count were last fetched
+let extrasAt = 0 // when the behind-count was last fetched
 let extrasFor = 0
 let required: string[] = []
 let behind = 0
 let queueSeen: Set<number> | undefined // review-queue PR numbers already announced
 let watchedRoot = '' // git toplevel the pane currently follows
+let nextPollAt = 0 // the 15s heartbeat skips ticks until this, which stretches the interval without new timer calls
+let failures = 0
 let timer: { cancel: () => void } | undefined
 let running = false // panes opened and polling for this session
 
@@ -163,32 +169,40 @@ async function refresh($: any, force = false) {
         author: p.author?.login ?? '',
         when: String(p.mergedAt || p.closedAt || p.updatedAt || '').slice(0, 16).replace('T', ' '),
       }))
-    const fields = 'number,title,url,state,isDraft,author,mergedAt,closedAt,updatedAt'
     if (!me) me = (await gh($, ['api', 'user'])).login
     const since = new Date(Date.now() - HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10)
-    const openRaw = await gh($, [
-      'pr', 'list', '-R', repo, '--author', '@me', '--state', 'open', '--limit', '20', '--json', `${fields},reviewDecision,statusCheckRollup`,
-    ])
-    const open: PrRow[] = rows(openRaw).map((r, i) => {
-      const cs = latestRuns(openRaw[i].statusCheckRollup ?? [])
+    const prevRepo: string = await read($, repoAtom)
+    const pinned = target ? Number(/#(\d+)$/.exec(target)![1]) : 0
+    const known: PrRow[] = prevRepo === repo ? [...(await read($, openAtom)), ...(await read($, historyAtom))] : []
+    const wanted: number = await read($, selectedAtom)
+    const guess = [pinned, wanted].find(n => n && known.some(p => p.number === n)) || pinned || known[0]?.number || 0
+    const [owner, name] = repo.split('/')
+    const slowDue = force || repo !== slowRepo || Date.now() - slowAt >= SLOW_POLL_MS
+    const fast = await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, {
+      list: `repo:${repo} is:pr is:open author:${me} sort:created-desc`,
+      merged: slowDue ? `repo:${repo} is:pr is:merged merged:>=${since} sort:updated-desc` : undefined,
+      queue: slowDue ? `repo:${repo} is:pr is:open review-requested:@me` : undefined,
+      num: guess,
+    })])
+    const openRaw = (fast.data.open.nodes as any[]).filter(n => n?.number)
+    const open: PrRow[] = openRaw.map(n => {
+      const cs = latestRuns(rollupOf(n))
       const failing = cs.filter(isFailed).length
       const checks = !cs.length ? 'none' : failing ? 'failed' : cs.some(isPending) ? 'running' : 'passed'
-      return { ...r, checks, failing, review: openRaw[i].reviewDecision || 'NONE' }
+      return {
+        number: n.number, title: n.title, url: n.url, state: n.state, isDraft: !!n.isDraft, author: n.author?.login ?? '',
+        when: String(n.updatedAt ?? '').slice(0, 16).replace('T', ' '), checks, failing, review: n.reviewDecision || 'NONE',
+      }
     })
     await update($, repoAtom, () => repo)
     await update($, openAtom, () => open)
     let history: PrRow[] = await read($, historyAtom)
-    if (force || repo !== slowRepo || Date.now() - slowAt >= SLOW_POLL_MS) {
-      const teamMerged = rows(await gh($, [
-        'pr', 'list', '-R', repo, '--state', 'merged', '--search', `merged:>=${since}`, '--limit', '200', '--json', fields,
-      ])).sort((a, b) => b.when.localeCompare(a.when))
+    if (slowDue) {
+      const teamMerged = rows(fast.data.merged.nodes.filter((n: any) => n?.number)).sort((a, b) => b.when.localeCompare(a.when))
       history = teamMerged.filter(p => p.author === me)
-      const requested = await gh($, [
-        'pr', 'list', '-R', repo, '--state', 'open', '--search', 'review-requested:@me', '--limit', '100',
-        '--json', `${fields},reviewRequests`,
-      ])
+      const requested = fast.data.queue.nodes.filter((n: any) => n?.number)
       const reviews: ReviewRow[] = rows(requested).map((r, i) => {
-        const asked = (requested[i].reviewRequests ?? []) as { login?: string; slug?: string; name?: string }[]
+        const asked = (requested[i].reviewRequests?.nodes ?? []).map((q: any) => q.requestedReviewer ?? {}) as { login?: string; slug?: string; name?: string }[]
         return {
           ...r,
           direct: asked.some(q => q.login === me),
@@ -210,44 +224,23 @@ async function refresh($: any, force = false) {
     }
 
     const chosen: number = await read($, selectedAtom)
-    const pinned = target ? Number(/#(\d+)$/.exec(target)![1]) : 0
     const number = [pinned, chosen].find(n => n && [...open, ...history].some(p => p.number === n)) || pinned || open[0]?.number || history[0]?.number
     if (!number) {
       await update($, prAtom, () => null)
       throw new Error(`No PRs of yours in ${repo}`)
     }
     await update($, selectedAtom, () => number)
-    const v = await gh($, [
-      'pr', 'view', String(number), '-R', repo, '--json',
-      'title,url,state,isDraft,reviewDecision,mergeable,mergeStateStatus,baseRefName,headRefName,latestReviews,statusCheckRollup',
-    ])
-    const checks = latestRuns(v.statusCheckRollup ?? [])
-    let unresolved = 0
-    let threads = 0
-    let commentCount = 0
-    let lastCommenter = ''
-    try {
-      const [owner, name] = repo.split('/')
-      const g = await gh($, ['api', 'graphql', '-f', `query=${COUNTS_QUERY}`, '-f', `o=${owner}`, '-f', `n=${name}`, '-F', `num=${number}`])
-      const p = g.data.repository.pullRequest
-      const nodes = p.reviewThreads.nodes as { isResolved: boolean; comments: { totalCount: number; nodes: Latest[] } }[]
-      threads = nodes.length
-      unresolved = nodes.filter(n => !n.isResolved).length
-      commentCount = p.comments.totalCount + nodes.reduce((a, n) => a + n.comments.totalCount, 0)
-      const latest = [...p.comments.nodes, ...nodes.flatMap(n => n.comments.nodes)] as Latest[]
-      latest.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-      lastCommenter = latest[0]?.author?.login ?? ''
-    } catch {
-      unresolved = -1
-    }
+    const v = number === guess ? fast.data.repository.pullRequest : (await gh($, ['api', 'graphql', ...gqlArgs(owner!, name!, { num: number })])).data.repository.pullRequest
+    if (!v) throw new Error(`#${number} not found in ${repo}`)
+    const checks = latestRuns(rollupOf(v))
+    const nodes = v.reviewThreads.nodes as { isResolved: boolean; comments: { totalCount: number; nodes: Latest[] } }[]
+    const threads = nodes.length
+    const unresolved = nodes.filter(n => !n.isResolved).length
+    const commentCount = v.comments.totalCount + nodes.reduce((a, n) => a + n.comments.totalCount, 0)
+    const latest = [...v.comments.nodes, ...nodes.flatMap(n => n.comments.nodes)] as Latest[]
+    latest.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    const lastCommenter = latest[0]?.author?.login ?? ''
     if (force || number !== extrasFor || Date.now() - extrasAt >= SLOW_POLL_MS) {
-      // `gh pr checks` exits non-zero while checks fail or run, the json is still on stdout
-      const req = await $.process.run(['gh', 'pr', 'checks', String(number), '-R', repo, '--required', '--json', 'name'], { timeoutMs: 30_000 })
-      try {
-        required = (JSON.parse(req.stdout || '[]') as { name: string }[]).map(c => c.name)
-      } catch {
-        required = []
-      }
       try {
         behind = (await gh($, ['api', `repos/${repo}/compare/${v.baseRefName}...${encodeURIComponent(v.headRefName)}`])).behind_by ?? 0
       } catch {
@@ -256,11 +249,12 @@ async function refresh($: any, force = false) {
       extrasAt = Date.now()
       extrasFor = number
     }
+    required = rollupOf(v).filter((c: any) => c.isRequired).map((c: any) => c.name ?? c.context)
     const pr: Pr = {
       repo, number, title: v.title, url: v.url, state: v.state, isDraft: v.isDraft,
       review: v.reviewDecision || 'NONE', mergeable: v.mergeable, checks, unresolved, threads,
       mergeState: v.mergeStateStatus ?? 'UNKNOWN', base: v.baseRefName ?? 'main', head: v.headRefName ?? '', behind, required,
-      latestReviews: (v.latestReviews ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
+      latestReviews: (v.latestReviews?.nodes ?? []).map((r: any) => ({ author: r.author?.login ?? '', state: r.state ?? '' })),
       commentCount, lastCommenter,
     }
     const prev: Pr | null = await read($, prAtom)
@@ -273,11 +267,18 @@ async function refresh($: any, force = false) {
     $.ui.status(
       `PR #${number} ${pr.state.toLowerCase()}${unresolved > 0 ? ` · ${unresolved} unresolved` : ''} · ${failed ? `${failed} failed` : running ? `${running} running` : 'checks ok'}`,
     )
+    failures = 0
+    const busy = running > 0 || open.some(r => r.checks === 'running')
+    const idleMs = (await read($, collapsedAtom)) ? MINIMISED_IDLE_POLL_MS : IDLE_POLL_MS
+    nextPollAt = (await $.clock.now()) + (busy ? POLL_MS : idleMs)
     const view: View = await read($, viewAtom)
     if (view.job) await loadSteps($, pr, view.job)
     if (view.comments) await loadComments($, pr)
   } catch (err) {
-    $.ui.log(`refresh failed: ${String((err as Error).message ?? err)}`, { to: 'debug' })
+    const reason = String((err as Error).message ?? err)
+    failures++
+    nextPollAt = (await $.clock.now()) + Math.min(BACKOFF_MAX_MS, (RATE_LIMITED.test(reason) ? SLOW_POLL_MS : POLL_MS) * 2 ** (failures - 1))
+    $.ui.log(`refresh failed: ${reason}`, { to: 'debug' })
     await update($, errorAtom, () => String((err as Error).message ?? err))
   }
 }
@@ -305,9 +306,45 @@ function latestRuns(rollup: any[]): Check[] {
   }))
 }
 
-const COUNTS_QUERY = `query($o:String!,$n:String!,$num:Int!){repository(owner:$o,name:$n){pullRequest(number:$num){
+const rollup = (required: boolean) => `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename
+...on CheckRun{name status conclusion detailsUrl startedAt checkSuite{workflowRun{workflow{name}}}${required ? ' isRequired(pullRequestNumber:$num)' : ''}}
+...on StatusContext{context state targetUrl createdAt${required ? ' isRequired(pullRequestNumber:$num)' : ''}}}}}}}}`
+const ROW_FIELDS = 'number title url state isDraft updatedAt mergedAt closedAt author{login}'
+const LIST_FIELDS = `${ROW_FIELDS} reviewDecision ${rollup(false)}`
+const QUEUE_FIELDS = `${ROW_FIELDS} reviewRequests(first:20){nodes{requestedReviewer{__typename ...on User{login} ...on Team{slug name}}}}`
+const DETAIL_FIELDS = `title url state isDraft reviewDecision mergeable mergeStateStatus baseRefName headRefName
+latestReviews(first:20){nodes{author{login} state}} ${rollup(true)}
 reviewThreads(first:100){nodes{isResolved comments(last:1){totalCount nodes{author{login} createdAt}}}}
-comments(last:1){totalCount nodes{author{login} createdAt}}}}}`
+comments(last:1){totalCount nodes{author{login} createdAt}}`
+
+type GqlPart = { list?: string; num?: number; merged?: string; queue?: string }
+// one request carries the open-PR list, the selected PR's detail and, when due, history and the review queue
+function gqlArgs(owner: string, name: string, part: GqlPart): string[] {
+  const search = (alias: string, v: string, fields: string) => `${alias}:search(query:${v},type:ISSUE,first:${alias === 'open' ? 20 : 100}){nodes{...on PullRequest{${fields}}}}`
+  const decl = [
+    '$o:String!', '$n:String!',
+    ...(part.list ? ['$q:String!'] : []), ...(part.merged ? ['$mq:String!'] : []), ...(part.queue ? ['$rq:String!'] : []),
+    ...(part.num ? ['$num:Int!'] : []),
+  ].join(',')
+  const body = [
+    part.num ? `repository(owner:$o,name:$n){pullRequest(number:$num){${DETAIL_FIELDS}}}` : 'repository(owner:$o,name:$n){id}',
+    part.list ? search('open', '$q', LIST_FIELDS) : '',
+    part.merged ? search('merged', '$mq', ROW_FIELDS) : '',
+    part.queue ? search('queue', '$rq', QUEUE_FIELDS) : '',
+  ].join('\n')
+  return [
+    '-f', `query=query(${decl}){${body}}`, '-f', `o=${owner}`, '-f', `n=${name}`,
+    ...(part.list ? ['-f', `q=${part.list}`] : []), ...(part.merged ? ['-f', `mq=${part.merged}`] : []),
+    ...(part.queue ? ['-f', `rq=${part.queue}`] : []), ...(part.num ? ['-F', `num=${part.num}`] : []),
+  ]
+}
+
+// gh's own rollup shape, which latestRuns already reads
+function rollupOf(pr: any): any[] {
+  const nodes = pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []
+  return nodes.map((c: any) => (c.__typename === 'CheckRun' ? { ...c, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '' } : c))
+}
+
 type Latest = { author?: { login: string }; createdAt?: string }
 
 // a failing check on a PR claude opened or pushed to becomes context on your next prompt, never a prompt of its own
@@ -649,6 +686,7 @@ async function stop($: any) {
 }
 
 async function tick($: any) {
+  if ((await $.clock.now()) < nextPollAt) return
   await refresh($)
 }
 
