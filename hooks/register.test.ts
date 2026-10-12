@@ -719,6 +719,15 @@ describe('change alerts', () => {
   })
 })
 
+test('every open PR row carries its check state and blocker', async ($, on) => {
+  stub(on)
+  await $.command.run({ command: 'pulse', args: '' } as any)
+  const ui = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ text: ' · 1 failing' })).toBeDefined()
+  expect(await ui.find({ text: ' · ready' })).toBeDefined()
+})
+
 describe('collapsed band', () => {
   const BAND = { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 140 } as any
 
