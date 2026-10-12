@@ -49,6 +49,8 @@ const filled: string[] = []
 const toasts: string[] = []
 const paneLog: string[] = []
 const branchUpdates: string[] = []
+const reruns: string[] = []
+let rerunFails = false
 let localBranch = 'main'
 
 // what GitHub reports; a test mutates it between refreshes to raise alerts
@@ -94,6 +96,8 @@ const resetWorld = () => {
   toasts.length = 0
   paneLog.length = 0
   branchUpdates.length = 0
+  reruns.length = 0
+  rerunFails = false
   localBranch = 'main'
 }
 
@@ -143,6 +147,10 @@ const fakeGh = (argv: readonly string[]) => {
   if (a === 'gh api user') return ok({ login: 'me' })
   if (a.startsWith('gh pr list')) return ok([])
   if (a.startsWith('gh pr view')) return ok({ url: row(899, '').url })
+  if (a.startsWith('gh run rerun')) {
+    reruns.push(a)
+    return rerunFails ? { exitCode: 1, stdout: '', stderr: 'run 1 is still in progress\n' } : { exitCode: 0, stdout: '', stderr: '' }
+  }
   if (a.startsWith('gh pr update-branch')) {
     branchUpdates.push(a)
     if (world.mergeable === 'CONFLICTING') return { exitCode: 1, stdout: '', stderr: 'merge conflict between base and head\n' }
@@ -424,6 +432,31 @@ for (const surface of ['terminal', 'desktop'] as const) {
 }
 
 for (const surface of ['terminal', 'desktop'] as const) {
+  test(`re-runs the failed jobs of a run after a second press (${surface})`, async ($, on) => {
+    stub(on)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    expect((await ui_props(ui, 'rerun-CI-lint'))?.label).toBe('↻ Re-run')
+    await ui.press({ key: 'rerun-CI-lint' })
+    expect(reruns).toEqual([])
+    expect((await ui_props(ui, 'rerun-CI-lint'))?.label).toBe('Press again to re-run CI')
+    await ui.press({ key: 'rerun-CI-lint' })
+    expect(reruns).toEqual([`gh run rerun 1 --failed -R ${REPO}`])
+    expect(toasts).toContain('Re-running the failed jobs of CI')
+  })
+
+  test(`says why when github refuses the re-run (${surface})`, async ($, on) => {
+    stub(on)
+    rerunFails = true
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'rerun-CI-lint' })
+    await ui.press({ key: 'rerun-CI-lint' })
+    expect(toasts).toContain("Couldn't re-run CI: run 1 is still in progress")
+  })
+
   test(`updates a stale branch on github (${surface})`, async ($, on) => {
     stub(on)
     await $.command.run({ command: 'pulse', args: '' } as any)

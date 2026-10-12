@@ -551,6 +551,7 @@ async function addressThread($: any, pr: Pr, th: Thread) {
   ].join('\n'))
 }
 
+let rerunning = false // one re-run at a time, like branch updates
 let updating = false // one branch update at a time; a second press while it runs is ignored
 const CONFIRM_MS = 5000
 
@@ -568,6 +569,27 @@ async function confirmThen($: any, key: string, run: () => Promise<void>) {
 }
 
 // github updates the branch server-side; a rebase rewrites it, so a local checkout must pull before pushing again
+const runIdOf = (c: Check) => /\/actions\/runs\/(\d+)/.exec(c.url)?.[1] ?? ''
+
+// retries only the failed jobs of the run, which is the cheap fix for a flaky or cancelled job
+async function rerunFailed($: any, pr: Pr, c: Check) {
+  const run = runIdOf(c)
+  if (!run || rerunning) return
+  rerunning = true
+  try {
+    $.ui.toast(`Re-running the failed jobs of ${c.workflow}…`)
+    const r = await $.process.run(['gh', 'run', 'rerun', run, '--failed', '-R', pr.repo], { timeoutMs: 60_000 })
+    if (r.exitCode !== 0) {
+      $.ui.toast(`Couldn't re-run ${c.workflow}: ${(r.stderr || r.stdout || 'gh failed').trim().split('\n')[0]}`, { timeoutMs: 8000 })
+      return
+    }
+    $.ui.toast(`Re-running the failed jobs of ${c.workflow}`, { timeoutMs: 6000 })
+    await refresh($, true)
+  } finally {
+    rerunning = false
+  }
+}
+
 async function updateBranch($: any, pr: Pr, rebase: boolean) {
   if (updating) return
   updating = true
@@ -1240,6 +1262,13 @@ export const register: Register = (on, options) => {
               <Box key={`fail-row-${c.workflow}-${c.name}`} flexDirection="row" columnGap={1}>
                 {checkRow(c, `fail-${c.workflow}-${c.name}`, `${c.name} · ${c.workflow} ›`)}
                 <Button key={`fix-${c.workflow}-${c.name}`} label="✦ Fix with Claude" onPress={() => void fixCheck($, pr, c)} />
+                {runIdOf(c) !== '' && (
+                  <Button
+                    key={`rerun-${c.workflow}-${c.name}`}
+                    label={isArmed(armed, `rerun-${runIdOf(c)}`) ? `Press again to re-run ${c.workflow}` : '↻ Re-run'}
+                    onPress={() => void confirmThen($, `rerun-${runIdOf(c)}`, () => rerunFailed($, pr, c))}
+                  />
+                )}
               </Box>
             ))}
           </Box>
