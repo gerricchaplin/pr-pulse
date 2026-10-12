@@ -19,12 +19,14 @@ export type Pr = {
   threads: number
   mergeState: string
   base: string
+  head: string
   behind: number
   required: string[]
   latestReviews: { author: string; state: string }[]
   commentCount: number
   lastCommenter: string
 }
+export type Armed = { key: string; at: number }
 export type Alert = { at: number; text: string; tone: 'ok' | 'fail' | 'run' | 'info'; url: string }
 export type PrRow = {
   number: number
@@ -70,6 +72,7 @@ declare module 'claude-code' {
       collapsed: boolean
       followed: string[]
       notes: string[]
+      armed: Armed
     }
   }
 }

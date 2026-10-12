@@ -46,6 +46,8 @@ const opened: string[] = []
 const filled: string[] = []
 const toasts: string[] = []
 const paneLog: string[] = []
+const branchUpdates: string[] = []
+let localBranch = 'main'
 
 // what GitHub reports; a test mutates it between refreshes to raise alerts
 const world = {
@@ -84,6 +86,8 @@ const resetWorld = () => {
   filled.length = 0
   toasts.length = 0
   paneLog.length = 0
+  branchUpdates.length = 0
+  localBranch = 'main'
 }
 
 resetWorld()
@@ -126,6 +130,7 @@ const fakeGh = (argv: readonly string[]) => {
   const ok = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v), stderr: '' })
   if (argv[0] === 'uname') return { exitCode: 0, stdout: 'Darwin\n', stderr: '' }
   if (argv[0] === 'open') { opened.push(argv[1]!); return { exitCode: 0, stdout: '', stderr: '' } }
+  if (argv[0] === 'git' && argv.includes('--abbrev-ref')) return { exitCode: 0, stdout: `${localBranch}\n`, stderr: '' }
   if (argv[0] === 'git') return { exitCode: 0, stdout: '/repo\n', stderr: '' }
   if (a.startsWith('gh repo view')) return ok({ nameWithOwner: REPO })
   if (a.includes('review-requested:@me')) return ok(world.queue)
@@ -146,9 +151,15 @@ const fakeGh = (argv: readonly string[]) => {
   if (a.startsWith('gh pr view')) {
     return ok({
       title: 'test 2', url: row(899, '').url, state: world.prState, isDraft: world.isDraft, reviewDecision: world.review, mergeable: world.mergeable,
-      mergeStateStatus: world.mergeState, baseRefName: 'main', headRefName: 'trivial/pr-pulse-test-2',
+      mergeStateStatus: world.mergeState, baseRefName: 'main', headRefName: 'feature/widget-sizes',
       latestReviews: world.latestReviews, statusCheckRollup: world.checks,
     })
+  }
+  if (a.startsWith('gh pr update-branch')) {
+    branchUpdates.push(a)
+    if (world.mergeable === 'CONFLICTING') return { exitCode: 1, stdout: '', stderr: 'merge conflict between base and head\n' }
+    world.behind = 0
+    return { exitCode: 0, stdout: '', stderr: '' }
   }
   if (a.startsWith('gh pr checks')) return { exitCode: 1, stdout: JSON.stringify(world.required.map(name => ({ name }))), stderr: '' }
   if (a.startsWith('gh api repos/') && a.includes('/compare/')) return ok({ behind_by: world.behind })
@@ -390,6 +401,81 @@ for (const surface of ['terminal', 'desktop'] as const) {
 }
 
 for (const surface of ['terminal', 'desktop'] as const) {
+  test(`updates a stale branch on github (${surface})`, async ($, on) => {
+    stub(on)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'update-rebase' })
+    expect(branchUpdates).toEqual([])
+    expect((await ui_props(ui, 'update-rebase'))?.label).toBe('Press again to rebase #899 on main')
+    await ui.press({ key: 'update-rebase' })
+    expect(branchUpdates).toEqual([`gh pr update-branch 899 -R ${REPO} --rebase`])
+    expect(toasts).toContain('Rebased #899 on main')
+    expect(await ui.find({ text: '✓ up to date with main' })).toBeDefined()
+    expect(await ui.find({ text: '✦ Rebase with Claude' })).toBeUndefined()
+  })
+
+  test(`merges the base in without rebasing (${surface})`, async ($, on) => {
+    stub(on)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'update-merge' })
+    await ui.press({ key: 'update-merge' })
+    expect(branchUpdates).toEqual([`gh pr update-branch 899 -R ${REPO}`])
+    expect(toasts).toContain('Merged main into #899')
+  })
+
+  test(`one press only arms; pressing the other button re-arms instead of running (${surface})`, async ($, on) => {
+    stub(on)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'update-merge' })
+    await ui.press({ key: 'update-rebase' })
+    expect(branchUpdates).toEqual([])
+    expect((await ui_props(ui, 'update-merge'))?.label).toBe('⇣ Merge main in')
+    expect((await ui_props(ui, 'update-rebase'))?.label).toBe('Press again to rebase #899 on main')
+  })
+
+  test(`tells you to pull when your checkout is on the updated branch (${surface})`, async ($, on) => {
+    stub(on)
+    localBranch = 'feature/widget-sizes'
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'update-rebase' })
+    await ui.press({ key: 'update-rebase' })
+    expect(toasts).toContain('Rebased #899 on main: your checkout is on feature/widget-sizes, run `git pull --rebase` before pushing again')
+  })
+
+  test(`conflicts leave only the rebase with Claude (${surface})`, async ($, on) => {
+    stub(on)
+    world.mergeable = 'CONFLICTING'
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    expect(await ui_props(ui, 'update-rebase')).toBeUndefined()
+    expect(await ui_props(ui, 'update-merge')).toBeUndefined()
+    await ui.press({ key: 'rebase-claude' })
+    expect(branchUpdates).toEqual([])
+    expect(filled[0]).toContain('is 2 commits behind `main` and has merge conflicts')
+    expect(filled[0]).toContain('Rebase `feature/widget-sizes` onto the latest `origin/main`')
+    expect(filled[0]).toContain('ask before you push with `--force-with-lease`')
+  })
+
+  test(`an up-to-date branch shows no branch actions (${surface})`, async ($, on) => {
+    stub(on)
+    world.behind = 0
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    expect(await ui_props(ui, 'rebase-claude')).toBeUndefined()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
   test(`a re-run that passes supersedes the old failure (${surface})`, async ($, on) => {
     stub(on)
     world.checks = [
@@ -467,6 +553,17 @@ describe('change alerts', () => {
     expect(await poll()).toEqual(['● #899 is ready to merge'])
     world.prState = 'MERGED'
     expect(await poll()).toEqual(['⑂ #899 merged'])
+  })
+
+  test('a merge to the base leaves the branch behind, then conflicting', async ($, on) => {
+    stub(on)
+    world.behind = 0
+    const { poll } = await watch($)
+    world.behind = 3
+    expect(await poll()).toEqual(['⇣ #899 is 3 commits behind main'])
+    expect(await poll()).toEqual([])
+    world.mergeable = 'CONFLICTING'
+    expect(await poll()).toEqual(['✗ #899 has merge conflicts with main'])
   })
 
   test('closed without merging', async ($, on) => {
