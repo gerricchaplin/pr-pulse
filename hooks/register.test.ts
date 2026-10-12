@@ -51,12 +51,16 @@ const paneLog: string[] = []
 const branchUpdates: string[] = []
 const reruns: string[] = []
 let rerunFails = false
+const merges: string[] = []
 let localBranch = 'main'
 
 // what GitHub reports; a test mutates it between refreshes to raise alerts
 const world = {
   mergeChecks: null as any[] | null,
   mergedAt: '2026-10-05T10:00:00Z',
+  autoMerge: null as string | null,
+  canAutoMerge: true,
+  mergeMethods: { squashMergeAllowed: true, mergeCommitAllowed: false, rebaseMergeAllowed: false },
   checks: CHECKS as any[],
   latestReviews: [] as { author: { login: string }; state: string }[],
   commentTotal: 1,
@@ -98,6 +102,10 @@ const resetWorld = () => {
   branchUpdates.length = 0
   reruns.length = 0
   rerunFails = false
+  merges.length = 0
+  world.autoMerge = null
+  world.canAutoMerge = true
+  world.mergeMethods = { squashMergeAllowed: true, mergeCommitAllowed: false, rebaseMergeAllowed: false }
   localBranch = 'main'
 }
 
@@ -151,6 +159,11 @@ const fakeGh = (argv: readonly string[]) => {
     reruns.push(a)
     return rerunFails ? { exitCode: 1, stdout: '', stderr: 'run 1 is still in progress\n' } : { exitCode: 0, stdout: '', stderr: '' }
   }
+  if (a.startsWith('gh pr merge')) {
+    merges.push(a)
+    world.autoMerge = a.includes('--disable-auto') ? null : a.includes('--squash') ? 'SQUASH' : a.includes('--rebase') ? 'REBASE' : 'MERGE'
+    return { exitCode: 0, stdout: '', stderr: '' }
+  }
   if (a.startsWith('gh pr update-branch')) {
     branchUpdates.push(a)
     if (world.mergeable === 'CONFLICTING') return { exitCode: 1, stdout: '', stderr: 'merge conflict between base and head\n' }
@@ -169,6 +182,8 @@ const fakeGh = (argv: readonly string[]) => {
     const detail = () => ({
       mergedAt: world.mergedAt,
       mergeCommit: world.prState === 'MERGED' ? { statusCheckRollup: world.mergeChecks ? { contexts: { nodes: world.mergeChecks.map(c => ({ ...c, checkSuite: { workflowRun: { workflow: { name: c.workflowName } } } })) } } : null } : null,
+      autoMergeRequest: world.autoMerge ? { mergeMethod: world.autoMerge } : null,
+      viewerCanEnableAutoMerge: world.canAutoMerge && !world.autoMerge, viewerCanDisableAutoMerge: !!world.autoMerge,
       title: 'test 2', url: row(899, '').url, state: world.prState, isDraft: world.isDraft, reviewDecision: world.review, mergeable: world.mergeable,
       mergeStateStatus: world.mergeState, baseRefName: 'main', headRefName: 'feature/widget-sizes',
       latestReviews: { nodes: world.latestReviews },
@@ -177,7 +192,7 @@ const fakeGh = (argv: readonly string[]) => {
       comments: { totalCount: world.commentTotal, nodes: [{ author: { login: world.lastCommenter }, createdAt: '2026-10-05T19:00:00Z' }] },
     })
     const data: any = {}
-    if (a.includes('pullRequest(number:$num)')) data.repository = { pullRequest: detail() }
+    if (a.includes('pullRequest(number:$num)')) data.repository = { ...world.mergeMethods, pullRequest: detail() }
     if (a.includes('merged:search')) {
       data.merged = { nodes: [
         { ...row(890, 'mine merged'), state: 'MERGED', author: { login: 'me' }, mergedAt: '2026-10-04T10:00:00Z' },
@@ -455,6 +470,43 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.press({ key: 'rerun-CI-lint' })
     await ui.press({ key: 'rerun-CI-lint' })
     expect(toasts).toContain("Couldn't re-run CI: run 1 is still in progress")
+  })
+
+  test(`turns auto-merge on and off behind a second press (${surface})`, async ($, on) => {
+    stub(on)
+    world.isDraft = false
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'auto-merge-on' })
+    expect(merges).toEqual([])
+    expect((await ui_props(ui, 'auto-merge-on'))?.label).toBe('Press again to squash-merge #899 once checks pass')
+    await ui.press({ key: 'auto-merge-on' })
+    expect(merges).toEqual([`gh pr merge 899 -R ${REPO} --auto --squash`])
+    expect(toasts).toContain('Auto-merge on for #899: it merges (squash) once required checks pass')
+    expect(await ui.find({ text: '⚡ auto-merge on (squash)' })).toBeDefined()
+
+    await ui.press({ key: 'auto-merge-off' })
+    await ui.press({ key: 'auto-merge-off' })
+    expect(merges[1]).toBe(`gh pr merge 899 -R ${REPO} --disable-auto`)
+    expect(await ui.find({ text: '⚡ auto-merge on (squash)' })).toBeUndefined()
+  })
+
+  test(`uses the repo's allowed merge method and hides the button for drafts or when github refuses it (${surface})`, async ($, on) => {
+    stub(on)
+    world.isDraft = false
+    world.mergeMethods = { squashMergeAllowed: false, mergeCommitAllowed: false, rebaseMergeAllowed: true }
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    const ui = await mount($, { plugin: 'pr-pulse', surface, component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'auto-merge-on' })
+    await ui.press({ key: 'auto-merge-on' })
+    expect(merges).toEqual([`gh pr merge 899 -R ${REPO} --auto --rebase`])
+
+    world.autoMerge = null
+    world.canAutoMerge = false
+    await ui.press({ key: 'refresh' })
+    expect(await ui.find({ key: 'auto-merge-on' })).toBeUndefined()
   })
 
   test(`updates a stale branch on github (${surface})`, async ($, on) => {
