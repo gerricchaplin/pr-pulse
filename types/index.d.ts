@@ -68,6 +68,8 @@ declare module 'claude-code' {
       repoCache: string
       alerts: Alert[]
       collapsed: boolean
+      followed: string[]
+      notes: string[]
     }
   }
 }
