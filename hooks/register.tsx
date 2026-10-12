@@ -789,11 +789,14 @@ function blocker(p: PrRow) {
   return 'ready'
 }
 
+function glyph(p: PrRow) {
+  const t = theme
+  return p.checks === 'failed' ? { g: '✗', c: t.fail } : p.checks === 'running' ? { g: '◐', c: t.run } : p.checks === 'passed' ? { g: '✓', c: t.ok } : { g: '○', c: t.muted }
+}
+
 function band(ui: any, $: any, open: PrRow[], selected: number, queue: number, latest: Alert | undefined) {
   const { Box, Text, Button } = ui
   const t = theme
-  const glyph = (p: PrRow) =>
-    p.checks === 'failed' ? { g: '✗', c: t.fail } : p.checks === 'running' ? { g: '◐', c: t.run } : p.checks === 'passed' ? { g: '✓', c: t.ok } : { g: '○', c: t.muted }
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
@@ -959,11 +962,15 @@ export const register: Register = (on, options) => {
         {openPrs.length === 0 && <Text color={t.muted}>None open.</Text>}
         {openPrs.map(p => {
           const isSel = p.number === selected
+          const gl = glyph(p)
+          const b = blocker(p)
           return (
             <Box key={`pr-row-${p.number}`} flexDirection="row">
               <Text color={t.brand}>{isSel ? '▸ ' : '  '}</Text>
+              <Text color={gl.c}>{gl.g} </Text>
               <Button plain key={`pr-${p.number}`} dimColor={!isSel} label={`#${p.number} ${p.title}`} onPress={pick(p.number)} />
-              {p.isDraft && <Text color={t.muted}> · draft</Text>}
+              {p.isDraft && b !== 'draft' && <Text color={t.muted}> · draft</Text>}
+              <Text color={b === 'ready' ? t.ok : t.muted}> · {b}</Text>
             </Box>
           )
         })}
