@@ -10,6 +10,7 @@ const POLL_MS = 15_000
 const HISTORY_DAYS = 7
 const SLOW_POLL_MS = 60_000 // history and review queue change slowly
 const IDLE_POLL_MS = 60_000 // nothing is running, so nothing changes quickly
+const MINIMISED_IDLE_POLL_MS = 120_000 // band only and nothing running: alerts can wait a little
 const BACKOFF_MAX_MS = 300_000
 const RATE_LIMITED = /rate limit|abuse detection|secondary rate/i
 
@@ -279,7 +280,9 @@ async function refresh($: any, force = false) {
       `PR #${number} ${pr.state.toLowerCase()}${unresolved > 0 ? ` · ${unresolved} unresolved` : ''} · ${failed ? `${failed} failed` : running ? `${running} running` : 'checks ok'}`,
     )
     failures = 0
-    nextPollAt = (await $.clock.now()) + (running || open.some(r => r.checks === 'running') ? POLL_MS : IDLE_POLL_MS)
+    const busy = running > 0 || open.some(r => r.checks === 'running')
+    const idleMs = (await read($, collapsedAtom)) ? MINIMISED_IDLE_POLL_MS : IDLE_POLL_MS
+    nextPollAt = (await $.clock.now()) + (busy ? POLL_MS : idleMs)
     const view: View = await read($, viewAtom)
     if (view.job) await loadSteps($, pr, view.job)
     if (view.comments) await loadComments($, pr)

@@ -960,6 +960,20 @@ describe('adaptive polling', () => {
     expect(listCalls(calls)).toBe(settled + 1)
   })
 
+  kitTest('stretches idle polling to 120s while minimised to the band', async ($, on) => {
+    resetWorld()
+    world.checks = CHECKS.map(c => ({ ...c, status: 'COMPLETED', conclusion: 'SUCCESS' }))
+    const { calls, clock } = await watch($, on)
+    const pane = await mount($, { plugin: 'pr-pulse', surface: 'terminal', component: 'Pane', props: {} as any, requestId: 'pr-pulse' })
+    await pane.press({ key: 'minimise' })
+    await clock.advance(60_000)
+    const settled = listCalls(calls)
+    await clock.advance(105_000)
+    expect(listCalls(calls)).toBe(settled)
+    await clock.advance(15_000)
+    expect(listCalls(calls)).toBe(settled + 1)
+  })
+
   kitTest('backs off after a rate-limit error and recovers on success', async ($, on) => {
     resetWorld()
     const rate = { limited: true }
