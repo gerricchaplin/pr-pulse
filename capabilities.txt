@@ -2,6 +2,7 @@
 # CI (scripts/check-capabilities.py) fails when this changes, so any new reach is reviewed in the PR.
 # Programs it runs via $.process.run are pinned separately by the tests: gh, git, uname, open/xdg-open (https only).
 call $.clock.every
+call $.clock.now
 call $.command.register
 call $.config.list
 call $.process.run

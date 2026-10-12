@@ -9,6 +9,9 @@ const REVIEWS = 'pr-pulse-reviews'
 const POLL_MS = 15_000
 const HISTORY_DAYS = 7
 const SLOW_POLL_MS = 60_000 // history and review queue change slowly
+const IDLE_POLL_MS = 60_000 // nothing is running, so nothing changes quickly
+const BACKOFF_MAX_MS = 300_000
+const RATE_LIMITED = /rate limit|abuse detection|secondary rate/i
 
 const prAtom = atom({ plugin: 'pr-pulse', key: 'pr' } as const, null as Pr | null)
 const errorAtom = atom({ plugin: 'pr-pulse', key: 'error' } as const, '')
@@ -47,6 +50,8 @@ let required: string[] = []
 let behind = 0
 let queueSeen: Set<number> | undefined // review-queue PR numbers already announced
 let watchedRoot = '' // git toplevel the pane currently follows
+let nextPollAt = 0 // the 15s heartbeat skips ticks until this, which stretches the interval without new timer calls
+let failures = 0
 let timer: { cancel: () => void } | undefined
 let running = false // panes opened and polling for this session
 
@@ -273,11 +278,16 @@ async function refresh($: any, force = false) {
     $.ui.status(
       `PR #${number} ${pr.state.toLowerCase()}${unresolved > 0 ? ` · ${unresolved} unresolved` : ''} · ${failed ? `${failed} failed` : running ? `${running} running` : 'checks ok'}`,
     )
+    failures = 0
+    nextPollAt = (await $.clock.now()) + (running || open.some(r => r.checks === 'running') ? POLL_MS : IDLE_POLL_MS)
     const view: View = await read($, viewAtom)
     if (view.job) await loadSteps($, pr, view.job)
     if (view.comments) await loadComments($, pr)
   } catch (err) {
-    $.ui.log(`refresh failed: ${String((err as Error).message ?? err)}`, { to: 'debug' })
+    const reason = String((err as Error).message ?? err)
+    failures++
+    nextPollAt = (await $.clock.now()) + Math.min(BACKOFF_MAX_MS, (RATE_LIMITED.test(reason) ? SLOW_POLL_MS : POLL_MS) * 2 ** (failures - 1))
+    $.ui.log(`refresh failed: ${reason}`, { to: 'debug' })
     await update($, errorAtom, () => String((err as Error).message ?? err))
   }
 }
@@ -649,6 +659,7 @@ async function stop($: any) {
 }
 
 async function tick($: any) {
+  if ((await $.clock.now()) < nextPollAt) return
   await refresh($)
 }
 

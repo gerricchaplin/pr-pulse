@@ -1,4 +1,4 @@
-import { describe, expect, test as kitTest } from 'claude-code/testing'
+import { describe, expect, mock, test as kitTest } from 'claude-code/testing'
 
 // a drawing left mounted redraws after its test ends and trips the kit's leak check; unmount every one
 const mounted: { unmount: () => Promise<void> }[] = []
@@ -16,6 +16,7 @@ const test = (name: string, a: Body | { options: Record<string, boolean> }, b?: 
   const [opts, body] = typeof a === 'function' ? [undefined, a] : [a, b!]
   const run = async ($: any, on: any) => {
     violations.length = 0
+    on('clock.now', async () => ({ value: Date.now() }) as any)
     try {
       await body($, on)
     } finally {
@@ -921,5 +922,54 @@ describe('CI-aware agent', () => {
     agent(on, 'https://github.com/acme/widgets/pull/898\n')
     await claudeRuns($, 'gh pr create --fill')
     expect(toasts).toEqual([])
+  })
+})
+
+describe('adaptive polling', () => {
+  // own clock: the shared wrapper stubs clock.now, and a second hook for it would not load
+  const listCalls = (calls: string[]) => calls.filter(a => a.startsWith('gh pr list') && a.includes('--state open --limit 20')).length
+  const watch = async ($: any, on: any, rate?: { limited: boolean }) => {
+    const calls: string[] = []
+    const clock = mock.clock(on)
+    on('process.run', async (_$: any, e: any) => {
+      calls.push(e.argv.join(' '))
+      if (rate?.limited && e.argv[0] === 'gh' && e.argv[1] === 'pr') return { value: { exitCode: 1, stdout: '', stderr: 'API rate limit exceeded' } }
+      return { value: fakeGh(e.argv) }
+    })
+    on('ui.open', async () => ({ value: {} }) as any)
+    on('ui.close', async () => ({ value: undefined }) as any)
+    on('ui.status', async () => ({ value: undefined }) as any)
+    on('ui.log', async () => ({ value: undefined }) as any)
+    await $.command.run({ command: 'pulse', args: '' } as any)
+    return { calls, clock }
+  }
+
+  kitTest('polls every 15s while checks run, then slows to 60s once they finish', async ($, on) => {
+    resetWorld()
+    const { calls, clock } = await watch($, on)
+    const first = listCalls(calls)
+    await clock.advance(15_000)
+    expect(listCalls(calls)).toBe(first + 1)
+
+    world.checks = CHECKS.map(c => ({ ...c, status: 'COMPLETED', conclusion: 'SUCCESS' }))
+    await clock.advance(15_000)
+    const settled = listCalls(calls)
+    await clock.advance(45_000)
+    expect(listCalls(calls)).toBe(settled)
+    await clock.advance(15_000)
+    expect(listCalls(calls)).toBe(settled + 1)
+  })
+
+  kitTest('backs off after a rate-limit error and recovers on success', async ($, on) => {
+    resetWorld()
+    const rate = { limited: true }
+    const { calls, clock } = await watch($, on, rate)
+    const first = listCalls(calls)
+    await clock.advance(30_000)
+    expect(listCalls(calls)).toBe(first)
+
+    rate.limited = false
+    await clock.advance(30_000)
+    expect(listCalls(calls)).toBe(first + 1)
   })
 })
