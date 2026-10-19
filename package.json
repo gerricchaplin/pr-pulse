@@ -9,6 +9,6 @@
     "capabilities": "python3 scripts/check-capabilities.py"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-code": "2.1.289"
+    "@anthropic-ai/claude-code": "2.1.296"
   }
 }
